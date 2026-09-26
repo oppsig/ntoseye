@@ -6,6 +6,10 @@
 
 use std::io;
 
+use super::framing::{
+    CONTROL_PACKET_LEADER, DATA_PACKET_LEADER, HEADER_SIZE, Header, PACKET_MAX_SIZE,
+};
+
 pub(crate) const KDUSB_VENDOR_ID: u16 = 0x3495;
 pub(crate) const KDUSB_PRODUCT_ID: u16 = 0x00e0;
 pub(crate) const KDUSB_HARDWARE_IDS: &[(u16, u16)] = &[
@@ -27,6 +31,84 @@ pub(crate) const TARGET_NAME_MAX: usize = 24;
 
 pub(crate) const USB_READ_REQUEST: usize = 0x0fb0;
 pub(crate) const USB3_WRITE_CHUNK: usize = 0x1000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootstrapTransfer {
+    NameMatch { consumed: usize },
+    NameMismatch { actual: String },
+    KdPrefetch,
+}
+
+/// Classify the first non-empty bulk-IN transfer after NAME?.
+///
+/// A live target can already have a KD packet queued when userspace claims the
+/// interface. In that case the transfer is not a failed NAME handshake: it is
+/// debugger traffic that must be preserved for KdFraming instead of discarded.
+fn classify_bootstrap_transfer(response: &[u8], expected: &str) -> io::Result<BootstrapTransfer> {
+    if response.starts_with(NAME_RESPONSE_PREFIX) {
+        let limit = response.len().min(NAME_RESPONSE_MAX);
+        let suffix = &response[NAME_RESPONSE_PREFIX.len()..limit];
+        let nul = suffix.iter().position(|&byte| byte == 0).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "KDUSB NAME response is not NUL terminated within the recovered maximum",
+            )
+        })?;
+
+        let logical_end = NAME_RESPONSE_PREFIX.len() + nul + 1;
+        let actual = parse_name_response(&response[..logical_end])?.to_string();
+
+        // The recovered target emits a second zero byte. The Windows parser
+        // only requires the first terminator, so consume the second when it is
+        // present and preserve anything after it as debugger stream data.
+        let consumed = if response.get(logical_end) == Some(&0) {
+            logical_end + 1
+        } else {
+            logical_end
+        };
+
+        return Ok(if actual == expected {
+            BootstrapTransfer::NameMatch { consumed }
+        } else {
+            BootstrapTransfer::NameMismatch { actual }
+        });
+    }
+
+    let Some(header) = Header::peek(response) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "KDUSB bootstrap transfer is neither NAME= nor a complete KD header ({} bytes)",
+                response.len()
+            ),
+        ));
+    };
+
+    let plausible = match header.leader {
+        DATA_PACKET_LEADER => {
+            (1..=11).contains(&header.packet_type)
+                && usize::from(header.byte_count) <= PACKET_MAX_SIZE
+        }
+        CONTROL_PACKET_LEADER => {
+            matches!(header.packet_type, 4..=6)
+                && header.byte_count == 0
+                && header.checksum == 0
+        }
+        _ => false,
+    };
+
+    if plausible {
+        Ok(BootstrapTransfer::KdPrefetch)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "KDUSB bootstrap transfer is neither NAME= nor plausible KD framing                  (leader={:#010x}, type={}, byte_count={})",
+                header.leader, header.packet_type, header.byte_count
+            ),
+        ))
+    }
+}
 
 /// Parse the USB2DBG bootstrap reply and return its target name.
 ///
@@ -159,6 +241,14 @@ pub(crate) struct KdUsbStreamCore<I: BulkIo> {
 
 impl<I: BulkIo> KdUsbStreamCore<I> {
     pub(crate) fn new(io: I, endpoints: BulkEndpoints) -> io::Result<Self> {
+        Self::new_with_rx(io, endpoints, Vec::<u8>::new())
+    }
+
+    fn new_with_rx(
+        io: I,
+        endpoints: BulkEndpoints,
+        prefetched: impl IntoIterator<Item = u8>,
+    ) -> io::Result<Self> {
         if endpoints.input & 0x80 == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -183,7 +273,7 @@ impl<I: BulkIo> KdUsbStreamCore<I> {
             endpoints,
             read_timeout: None,
             write_timeout: std::time::Duration::from_secs(1),
-            rx: std::collections::VecDeque::new(),
+            rx: prefetched.into_iter().collect(),
             tx: Vec::new(),
             write_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         })
@@ -331,9 +421,9 @@ mod linux {
     impl KdUsbStream {
         pub(crate) fn connect(target_name: &str) -> io::Result<Self> {
             validate_requested_target_name(target_name)?;
-            let (io, endpoints) = open_named_device(target_name)?;
+            let (io, endpoints, prefetched) = open_named_device(target_name)?;
             Ok(Self {
-                inner: KdUsbStreamCore::new(io, endpoints)?,
+                inner: KdUsbStreamCore::new_with_rx(io, endpoints, prefetched)?,
             })
         }
 
@@ -385,10 +475,25 @@ mod linux {
         KDUSB_HARDWARE_IDS.contains(&(vendor, product))
     }
 
-    fn open_named_device(target_name: &str) -> io::Result<(RusbBulkIo, BulkEndpoints)> {
+    enum ProbeOutcome {
+        Named {
+            io: RusbBulkIo,
+            prefetched: Vec<u8>,
+        },
+        KdPrefetch {
+            io: RusbBulkIo,
+            prefetched: Vec<u8>,
+        },
+    }
+
+    fn open_named_device(
+        target_name: &str,
+    ) -> io::Result<(RusbBulkIo, BulkEndpoints, Vec<u8>)> {
         let devices = rusb::devices().map_err(|err| usb_error("enumerating USB devices", err))?;
         let mut saw_interface = false;
         let mut last_error = None;
+        let mut kd_fallback = None;
+        let mut kd_fallback_count = 0usize;
 
         for device in devices.iter() {
             let descriptor = match device.device_descriptor() {
@@ -459,12 +564,38 @@ mod linux {
                         endpoints,
                         target_name,
                     ) {
-                        Ok(Some(io)) => return Ok((io, endpoints)),
+                        Ok(Some(ProbeOutcome::Named { io, prefetched })) => {
+                            return Ok((io, endpoints, prefetched));
+                        }
+                        Ok(Some(ProbeOutcome::KdPrefetch { io, prefetched })) => {
+                            kd_fallback_count += 1;
+                            if kd_fallback.is_none() {
+                                kd_fallback = Some((io, endpoints, prefetched));
+                            }
+                        }
                         Ok(None) => {}
                         Err(err) => last_error = Some(err),
                     }
                 }
             }
+        }
+
+        // A live Windows target may already be transmitting KD before it can
+        // answer the out-of-band NAME? query. If exactly one supported KDUSB
+        // interface proves itself by emitting plausible KD framing, select it
+        // and replay those bytes into KdFraming. Never guess when more than one
+        // such device exists because the requested target name is then
+        // ambiguous.
+        if kd_fallback_count == 1 {
+            return Ok(kd_fallback.expect("single KD fallback must be retained"));
+        }
+        if kd_fallback_count > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{kd_fallback_count} active classic KDUSB devices emitted KD traffic before                      NAME=; target '{target_name}' is ambiguous"
+                ),
+            ));
         }
 
         if let Some(err) = last_error {
@@ -489,7 +620,7 @@ mod linux {
         alternate_setting: u8,
         endpoints: BulkEndpoints,
         target_name: &str,
-    ) -> io::Result<Option<RusbBulkIo>> {
+    ) -> io::Result<Option<ProbeOutcome>> {
         let handle = device
             .open()
             .map_err(|err| usb_error("opening classic KDUSB device", err))?;
@@ -535,16 +666,33 @@ mod linux {
             ));
         }
 
-        let mut response = [0u8; NAME_RESPONSE_MAX];
-        let received = handle
-            .read_bulk(endpoints.input, &mut response, DISCOVERY_TIMEOUT)
-            .map_err(|err| usb_error("reading KDUSB NAME= reply", err))?;
+        // Match USB2DBG's recovered 4016-byte receive request. The previous
+        // <=37-byte buffer could overflow before userspace had a chance to
+        // classify a live KD packet that raced the NAME= reply.
+        let mut response = vec![0u8; USB_READ_REQUEST];
+        let received = loop {
+            let count = handle
+                .read_bulk(endpoints.input, &mut response, DISCOVERY_TIMEOUT)
+                .map_err(|err| usb_error("reading KDUSB bootstrap transfer", err))?;
+            if count != 0 {
+                break count;
+            }
+        };
+        let transfer = &response[..received];
 
-        if !name_response_matches(&response[..received], target_name)? {
-            return Ok(None);
+        match classify_bootstrap_transfer(transfer, target_name)? {
+            BootstrapTransfer::NameMatch { consumed } => {
+                Ok(Some(ProbeOutcome::Named {
+                    io: RusbBulkIo { handle },
+                    prefetched: transfer[consumed..].to_vec(),
+                }))
+            }
+            BootstrapTransfer::NameMismatch { .. } => Ok(None),
+            BootstrapTransfer::KdPrefetch => Ok(Some(ProbeOutcome::KdPrefetch {
+                io: RusbBulkIo { handle },
+                prefetched: transfer.to_vec(),
+            })),
         }
-
-        Ok(Some(RusbBulkIo { handle }))
     }
 
     fn usb_error(context: &str, err: rusb::Error) -> io::Error {
@@ -659,6 +807,57 @@ mod tests {
     }
 
     const CLSA0102_REPLY: &[u8] = b"NAME=CLSA0102_USB\0\0";
+
+    #[test]
+    fn stream_replays_prefetched_kd_bytes_before_new_usb_reads() {
+        let io = MockBulkIo::with_reads([b"later".to_vec()]);
+        let mut stream =
+            KdUsbStreamCore::new_with_rx(io, test_endpoints(), b"early".iter().copied()).unwrap();
+
+        let mut first = [0u8; 5];
+        stream.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"early");
+        assert!(stream.io.read_requests.lock().unwrap().is_empty());
+
+        let mut second = [0u8; 5];
+        stream.read_exact(&mut second).unwrap();
+        assert_eq!(&second, b"later");
+        assert_eq!(stream.io.read_requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bootstrap_name_match_preserves_trailing_stream_bytes() {
+        let mut transfer = CLSA0102_REPLY.to_vec();
+        transfer.extend_from_slice(b"KD");
+        assert_eq!(
+            classify_bootstrap_transfer(&transfer, "CLSA0102_USB").unwrap(),
+            BootstrapTransfer::NameMatch {
+                consumed: CLSA0102_REPLY.len()
+            }
+        );
+    }
+
+    #[test]
+    fn bootstrap_name_mismatch_is_not_silently_accepted() {
+        assert_eq!(
+            classify_bootstrap_transfer(CLSA0102_REPLY, "OTHER").unwrap(),
+            BootstrapTransfer::NameMismatch {
+                actual: "CLSA0102_USB".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn observed_live_file_io_header_is_classified_as_kd_prefetch() {
+        let observed = hex::decode(
+            "303030300b00920000088080a0110000303400000000000089001200800000000100000001000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        assert_eq!(
+            classify_bootstrap_transfer(&observed, "CLSA0102_USB").unwrap(),
+            BootstrapTransfer::KdPrefetch
+        );
+    }
 
     #[test]
     fn stream_buffers_surplus_bulk_read_bytes() {
