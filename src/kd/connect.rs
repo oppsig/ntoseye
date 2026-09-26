@@ -18,6 +18,8 @@ use super::breakpoints::{
     breakpoint_instruction_at, reclaimed_breakpoints_notice, restore_unowned_breakpoint_handles,
 };
 use super::halt::HaltRegisters;
+#[cfg(target_os = "linux")]
+use super::kdusb::KdUsbStream;
 use super::kdnet::KdNetStream;
 use super::memory::{KD_REMOTE_MEMORY_CHUNK, LineCache};
 use super::registers::{ARM64_WINDBG_TTBR1_EL1, KSPECIAL_REGISTERS_CR3_OFFSET};
@@ -67,6 +69,20 @@ impl KdBackend {
             KdTransport::Serial(stream),
             "kd: serial connected; waiting for Windows KD target",
             "kd",
+            progress,
+        )
+    }
+
+    /// Connect to a classic KDUSB target and stop at the initial state-change.
+    #[cfg(target_os = "linux")]
+    pub fn connect_usb(target_name: &str, progress: &mut dyn FnMut(&str)) -> Result<Self> {
+        progress(&format!("kdusb: locating classic KDUSB target {target_name}"));
+        let stream = KdUsbStream::connect(target_name)
+            .map_err(|err| Error::Kd(format!("KDUSB target {target_name}: {err}")))?;
+        Self::connect_transport(
+            KdTransport::Usb(stream),
+            "kdusb: target identified; waiting for Windows KD target",
+            "kdusb",
             progress,
         )
     }
