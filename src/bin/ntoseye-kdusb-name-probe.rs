@@ -39,6 +39,7 @@ mod linux {
     const NAME_PREFIX: &[u8; 5] = b"NAME=";
     const NAME_RESPONSE_MAX: usize = 37;
     const TARGET_NAME_MAX: usize = 24;
+    const USB_READ_REQUEST: usize = 0x0fb0;
     const TIMEOUT: Duration = Duration::from_secs(1);
 
     struct ProbeReport {
@@ -50,6 +51,8 @@ mod linux {
         bulk_out: u8,
         max_packet: u16,
         reply: Vec<u8>,
+        usb_rx_len: usize,
+        trailing_rx_len: usize,
         target_name: String,
     }
 
@@ -77,8 +80,11 @@ mod linux {
         println!("MAX_PACKET={}", report.max_packet);
         println!("PROBE_TX_LEN={}", NAME_PROBE.len());
         println!("PROBE_TX_HEX={}", hex::encode(NAME_PROBE));
+        println!("USB_RX_REQUEST_LEN={USB_READ_REQUEST}");
+        println!("USB_RX_TRANSFER_LEN={}", report.usb_rx_len);
         println!("REPLY_RX_LEN={}", report.reply.len());
         println!("REPLY_RX_HEX={}", hex::encode(&report.reply));
+        println!("TRAILING_RX_LEN={}", report.trailing_rx_len);
         println!("REPLY_TARGET={}", report.target_name);
         println!("INTERFACE_RELEASED=true");
         println!("USB_CONTROL_TRANSFER=false");
@@ -243,14 +249,32 @@ mod linux {
                 ));
             }
 
-            let mut response = [0u8; NAME_RESPONSE_MAX];
+            // USB2DBG posts a 4016-byte USB receive and presents the result as
+            // a byte stream to its caller. A raw libusb buffer sized only to
+            // the <=37-byte logical NAME reply can overflow when the device
+            // completes a larger USB transfer. Match the recovered Windows
+            // receive quantum, then validate only the logical NAME response.
+            let mut response = vec![0u8; USB_READ_REQUEST];
             let received = handle
                 .read_bulk(bulk_in, &mut response, TIMEOUT)
                 .map_err(|err| format!("reading KDUSB NAME= reply: {err}"))?;
-            let reply = response[..received].to_vec();
+
+            let logical_len = NAME_PREFIX.len() + expected.len() + 2;
+            if logical_len > NAME_RESPONSE_MAX {
+                return Err(format!(
+                    "expected NAME reply length {logical_len} exceeds logical maximum {NAME_RESPONSE_MAX}"
+                ));
+            }
+            if received < logical_len {
+                return Err(format!(
+                    "short KDUSB NAME= reply: received {received} bytes, need at least {logical_len}"
+                ));
+            }
+
+            let reply = response[..logical_len].to_vec();
             let target_name = parse_name_response(&reply)?.to_string();
 
-            if target_name != expected {
+            if target_name != expected || reply[logical_len - 2..] != [0, 0] {
                 return Ok(None);
             }
 
@@ -263,6 +287,8 @@ mod linux {
                 bulk_out,
                 max_packet,
                 reply,
+                usb_rx_len: received,
+                trailing_rx_len: received - logical_len,
                 target_name,
             }))
         })();
