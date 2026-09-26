@@ -59,6 +59,7 @@ literal_arg! {
     AttachBackend(Option<Backend>) {
         "kd" => Some(Backend::Kd),
         "kdnet" => Some(Backend::KdNet),
+        "kdusb" => Some(Backend::KdUsb),
         "gdb" => Some(Backend::Gdb),
         "memory" => Some(Backend::Memory),
         "dmp" => None,
