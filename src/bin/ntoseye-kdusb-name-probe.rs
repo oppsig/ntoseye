@@ -248,9 +248,9 @@ mod linux {
                 .read_bulk(bulk_in, &mut response, TIMEOUT)
                 .map_err(|err| format!("reading KDUSB NAME= reply: {err}"))?;
             let reply = response[..received].to_vec();
-            let actual = parse_name_response(&reply)?;
+            let target_name = parse_name_response(&reply)?.to_string();
 
-            if actual != expected {
+            if target_name != expected {
                 return Ok(None);
             }
 
@@ -263,7 +263,7 @@ mod linux {
                 bulk_out,
                 max_packet,
                 reply,
-                target_name: actual.to_string(),
+                target_name,
             }))
         })();
 
