@@ -88,9 +88,7 @@ fn classify_bootstrap_transfer(response: &[u8], expected: &str) -> io::Result<Bo
                 && usize::from(header.byte_count) <= PACKET_MAX_SIZE
         }
         CONTROL_PACKET_LEADER => {
-            matches!(header.packet_type, 4..=6)
-                && header.byte_count == 0
-                && header.checksum == 0
+            matches!(header.packet_type, 4..=6) && header.byte_count == 0 && header.checksum == 0
         }
         _ => false,
     };
@@ -474,19 +472,11 @@ mod linux {
     }
 
     enum ProbeOutcome {
-        Named {
-            io: RusbBulkIo,
-            prefetched: Vec<u8>,
-        },
-        KdPrefetch {
-            io: RusbBulkIo,
-            prefetched: Vec<u8>,
-        },
+        Named { io: RusbBulkIo, prefetched: Vec<u8> },
+        KdPrefetch { io: RusbBulkIo, prefetched: Vec<u8> },
     }
 
-    fn open_named_device(
-        target_name: &str,
-    ) -> io::Result<(RusbBulkIo, BulkEndpoints, Vec<u8>)> {
+    fn open_named_device(target_name: &str) -> io::Result<(RusbBulkIo, BulkEndpoints, Vec<u8>)> {
         let devices = rusb::devices().map_err(|err| usb_error("enumerating USB devices", err))?;
         let mut saw_interface = false;
         let mut last_error = None;
@@ -679,12 +669,10 @@ mod linux {
         let transfer = &response[..received];
 
         match classify_bootstrap_transfer(transfer, target_name)? {
-            BootstrapTransfer::NameMatch { consumed } => {
-                Ok(Some(ProbeOutcome::Named {
-                    io: RusbBulkIo { handle },
-                    prefetched: transfer[consumed..].to_vec(),
-                }))
-            }
+            BootstrapTransfer::NameMatch { consumed } => Ok(Some(ProbeOutcome::Named {
+                io: RusbBulkIo { handle },
+                prefetched: transfer[consumed..].to_vec(),
+            })),
             BootstrapTransfer::NameMismatch { .. } => Ok(None),
             BootstrapTransfer::KdPrefetch => Ok(Some(ProbeOutcome::KdPrefetch {
                 io: RusbBulkIo { handle },
