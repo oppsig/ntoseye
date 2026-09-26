@@ -116,11 +116,7 @@ mod linux {
         }
 
         validate_target_name(&expected)?;
-        let report = probe(
-            &expected,
-            accept_kd_prefetch,
-            complete_kd_prefetch_tail,
-        )?;
+        let report = probe(&expected, accept_kd_prefetch, complete_kd_prefetch_tail)?;
 
         println!("KDUSB_NAME_PROBE=PASS");
         println!("VID_PID={:04x}:{:04x}", report.vendor, report.product);
@@ -179,9 +175,7 @@ mod linux {
                 println!("TAIL_USB_RX_TRANSFER_LEN={tail_usb_rx_len}");
                 println!("TAIL_RX_PREFIX_HEX={tail_prefix_hex}");
                 println!("TAIL_EXTRA_RX_LEN={tail_extra_rx_len}");
-                println!(
-                    "KD_PACKET_COMPLETE_AFTER_TAIL_OBSERVATION={packet_complete_after_tail}"
-                );
+                println!("KD_PACKET_COMPLETE_AFTER_TAIL_OBSERVATION={packet_complete_after_tail}");
                 match trailer_valid {
                     Some(valid) => println!("KD_TRAILER_VALID={valid}"),
                     None => println!("KD_TRAILER_VALID=NA"),
@@ -421,9 +415,12 @@ mod linux {
                     tail_observation_performed = true;
                     let mut tail = vec![0u8; USB_READ_REQUEST];
                     tail_usb_rx_len = loop {
-                        let count = handle
-                            .read_bulk(bulk_in, &mut tail, TIMEOUT)
-                            .map_err(|err| format!("reading KDUSB prefetched packet tail: {err}"))?;
+                        let count =
+                            handle
+                                .read_bulk(bulk_in, &mut tail, TIMEOUT)
+                                .map_err(|err| {
+                                    format!("reading KDUSB prefetched packet tail: {err}")
+                                })?;
                         if count != 0 {
                             break count;
                         }
@@ -454,7 +451,9 @@ mod linux {
                         );
                     }
                     if !checksum_valid {
-                        return Err("prefetched KD packet checksum does not match header".to_string());
+                        return Err(
+                            "prefetched KD packet checksum does not match header".to_string()
+                        );
                     }
                     if trailer_valid == Some(false) {
                         return Err("prefetched KD data packet trailer is not 0xAA".to_string());
@@ -553,7 +552,9 @@ mod linux {
 
     fn kd_checksum_valid(header: KdHeader, packet: &[u8]) -> bool {
         if header.leader == CONTROL_PACKET_LEADER {
-            return header.byte_count == 0 && header.checksum == 0 && packet.len() >= KD_HEADER_SIZE;
+            return header.byte_count == 0
+                && header.checksum == 0
+                && packet.len() >= KD_HEADER_SIZE;
         }
 
         let payload_end = KD_HEADER_SIZE + usize::from(header.byte_count);
