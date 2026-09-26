@@ -200,3 +200,65 @@ pub mod ui;
 pub mod unwind;
 #[cfg(any(feature = "mcp", feature = "python"))]
 pub mod view;
+
+
+#[cfg(test)]
+mod backend_contract_tests {
+    use super::{Backend, TargetSpec};
+    use crate::kd::KdMemorySource;
+
+    #[test]
+    fn kdusb_backend_parses_and_has_no_default_endpoint() {
+        let backend: Backend = "kdusb".parse().expect("kdusb backend should parse");
+        assert_eq!(backend, Backend::KdUsb);
+        assert_eq!(backend.name(), "kdusb");
+        assert_eq!(backend.default_endpoint(), None);
+    }
+
+    #[test]
+    fn kdusb_target_requires_explicit_target_name() {
+        let missing = TargetSpec::Live {
+            backend: Backend::KdUsb,
+            connect: None,
+            kdnet_key: None,
+            memory_source: KdMemorySource::Auto,
+        };
+        let error = missing.validate().expect_err("missing target name must fail");
+        assert!(
+            error.to_string().contains("requires a target name"),
+            "{error}"
+        );
+
+        let empty = TargetSpec::Live {
+            backend: Backend::KdUsb,
+            connect: Some(String::new()),
+            kdnet_key: None,
+            memory_source: KdMemorySource::Auto,
+        };
+        assert!(empty.validate().is_err());
+    }
+
+    #[test]
+    fn kdusb_target_accepts_kd_memory_source_but_rejects_kdnet_key() {
+        let valid = TargetSpec::Live {
+            backend: Backend::KdUsb,
+            connect: Some("CLSA0102_USB".into()),
+            kdnet_key: None,
+            memory_source: KdMemorySource::Kd,
+        };
+        assert!(valid.validate().is_ok());
+        assert_eq!(valid.endpoint(), Some("CLSA0102_USB"));
+
+        let keyed = TargetSpec::Live {
+            backend: Backend::KdUsb,
+            connect: Some("CLSA0102_USB".into()),
+            kdnet_key: Some("1.2.3.4".into()),
+            memory_source: KdMemorySource::Auto,
+        };
+        let error = keyed.validate().expect_err("KDNET key must be rejected");
+        assert!(
+            error.to_string().contains("only valid for the kdnet backend"),
+            "{error}"
+        );
+    }
+}

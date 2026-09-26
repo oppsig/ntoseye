@@ -1083,6 +1083,19 @@ mod tests {
 
         let err = mcp
             .open(Parameters(OpenArgs {
+                backend: BackendArg::KdUsb,
+                connect: None,
+                key: None,
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("requires a target name"),
+            "{err:?}"
+        );
+
+        let err = mcp
+            .open(Parameters(OpenArgs {
                 backend: BackendArg::Memory,
                 connect: Some("127.0.0.1:1234".into()),
                 key: None,

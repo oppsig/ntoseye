@@ -455,6 +455,30 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    #[test]
+    fn kdusb_target_options_parse_without_opening_transport() {
+        use clap::Parser;
+
+        let parsed = Cli::try_parse_from([
+            "ntoseye",
+            "--backend",
+            "kdusb",
+            "--connect",
+            "CLSA0102_USB",
+            "--memory-source",
+            "kd",
+        ])
+        .expect("KDUSB CLI options should parse");
+
+        assert_eq!(parsed.target.backend, Some(crate::Backend::KdUsb));
+        assert_eq!(parsed.target.connect.as_deref(), Some("CLSA0102_USB"));
+        assert_eq!(
+            parsed.target.memory_source,
+            Some(crate::kd::KdMemorySource::Kd)
+        );
+        assert!(parsed.target.kdnet_key.is_none());
+    }
+
     /// Target options name the target whichever side of a server subcommand
     /// they are on.
     #[cfg(feature = "gdbserver")]
