@@ -272,11 +272,28 @@ mod linux {
                 ));
             }
 
+            let raw_prefix_len = received.min(64);
+            let raw_prefix_hex = hex::encode(&response[..raw_prefix_len]);
+
+            if !response[..received].starts_with(NAME_PREFIX) {
+                return Err(format!(
+                    "KDUSB NAME response is missing NAME= prefix; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
+                ));
+            }
+
             let reply = response[..logical_len].to_vec();
-            let target_name = parse_name_response(&reply)?.to_string();
+            let target_name = parse_name_response(&reply)
+                .map_err(|err| {
+                    format!(
+                        "{err}; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
+                    )
+                })?
+                .to_string();
 
             if target_name != expected || reply[logical_len - 2..] != [0, 0] {
-                return Ok(None);
+                return Err(format!(
+                    "KDUSB NAME reply did not match expected target '{expected}'; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
+                ));
             }
 
             Ok(Some(ProbeReport {
