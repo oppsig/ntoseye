@@ -8,6 +8,12 @@ use std::io;
 
 pub(crate) const KDUSB_VENDOR_ID: u16 = 0x3495;
 pub(crate) const KDUSB_PRODUCT_ID: u16 = 0x00e0;
+pub(crate) const KDUSB_HARDWARE_IDS: &[(u16, u16)] = &[
+    (0x3495, 0x00e0),
+    (0x0525, 0x127a),
+    (0x046b, 0x0980),
+    (0x045e, 0x062d),
+];
 
 pub(crate) const KDUSB_INTERFACE_CLASS: u8 = 0xdc;
 pub(crate) const KDUSB_INTERFACE_SUBCLASS: u8 = 0x02;
@@ -292,6 +298,306 @@ impl<I: BulkIo> std::io::Write for KdUsbStreamCore<I> {
         Ok(())
     }
 }
+
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::*;
+    use rusb::{Device, DeviceHandle, Direction, GlobalContext, TransferType};
+    use std::time::Duration;
+
+    const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
+
+    pub(crate) struct KdUsbStream {
+        inner: KdUsbStreamCore<RusbBulkIo>,
+    }
+
+    struct RusbBulkIo {
+        handle: DeviceHandle<GlobalContext>,
+    }
+
+    impl BulkIo for RusbBulkIo {
+        fn read_bulk(
+            &self,
+            endpoint: u8,
+            buf: &mut [u8],
+            timeout: Duration,
+        ) -> io::Result<usize> {
+            self.handle
+                .read_bulk(endpoint, buf, timeout)
+                .map_err(|err| usb_error("KDUSB bulk read", err))
+        }
+
+        fn write_bulk(
+            &self,
+            endpoint: u8,
+            buf: &[u8],
+            timeout: Duration,
+        ) -> io::Result<usize> {
+            self.handle
+                .write_bulk(endpoint, buf, timeout)
+                .map_err(|err| usb_error("KDUSB bulk write", err))
+        }
+    }
+
+    impl KdUsbStream {
+        pub(crate) fn connect(target_name: &str) -> io::Result<Self> {
+            validate_requested_target_name(target_name)?;
+            let (io, endpoints) = open_named_device(target_name)?;
+            Ok(Self {
+                inner: KdUsbStreamCore::new(io, endpoints)?,
+            })
+        }
+
+        pub(crate) fn try_clone(&self) -> io::Result<Self> {
+            Ok(Self {
+                inner: self.inner.try_clone()?,
+            })
+        }
+
+        pub(crate) fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+            self.inner.set_read_timeout(timeout);
+        }
+    }
+
+    impl std::io::Read for KdUsbStream {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(output)
+        }
+    }
+
+    impl std::io::Write for KdUsbStream {
+        fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+            self.inner.write(input)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    fn validate_requested_target_name(target_name: &str) -> io::Result<()> {
+        let valid = !target_name.is_empty()
+            && target_name.len() <= TARGET_NAME_MAX
+            && target_name
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'));
+
+        if valid {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "KDUSB target name must be 1..=24 bytes using A-Z, 0-9, '-' or '_'",
+            ))
+        }
+    }
+
+    fn is_known_hardware_id(vendor: u16, product: u16) -> bool {
+        KDUSB_HARDWARE_IDS.contains(&(vendor, product))
+    }
+
+    fn open_named_device(target_name: &str) -> io::Result<(RusbBulkIo, BulkEndpoints)> {
+        let devices =
+            rusb::devices().map_err(|err| usb_error("enumerating USB devices", err))?;
+        let mut saw_interface = false;
+        let mut last_error = None;
+
+        for device in devices.iter() {
+            let descriptor = match device.device_descriptor() {
+                Ok(descriptor) => descriptor,
+                Err(err) => {
+                    last_error = Some(usb_error("reading USB device descriptor", err));
+                    continue;
+                }
+            };
+
+            if !is_known_hardware_id(descriptor.vendor_id(), descriptor.product_id()) {
+                continue;
+            }
+
+            let config = match device.active_config_descriptor() {
+                Ok(config) => config,
+                Err(err) => {
+                    last_error = Some(usb_error("reading active USB configuration", err));
+                    continue;
+                }
+            };
+
+            for interface in config.interfaces() {
+                for descriptor in interface.descriptors() {
+                    if descriptor.class_code() != KDUSB_INTERFACE_CLASS
+                        || descriptor.sub_class_code() != KDUSB_INTERFACE_SUBCLASS
+                        || descriptor.protocol_code() != KDUSB_INTERFACE_PROTOCOL
+                    {
+                        continue;
+                    }
+
+                    let mut input = None;
+                    let mut output = None;
+
+                    for endpoint in descriptor.endpoint_descriptors() {
+                        if endpoint.transfer_type() != TransferType::Bulk {
+                            continue;
+                        }
+                        match endpoint.direction() {
+                            Direction::In if input.is_none() => {
+                                input = Some(endpoint.address());
+                            }
+                            Direction::Out if output.is_none() => {
+                                output =
+                                    Some((endpoint.address(), usize::from(endpoint.max_packet_size())));
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    let (Some(input), Some((output, max_packet))) = (input, output) else {
+                        continue;
+                    };
+
+                    saw_interface = true;
+                    let endpoints = BulkEndpoints {
+                        input,
+                        output,
+                        max_packet,
+                    };
+
+                    match open_and_probe(
+                        &device,
+                        descriptor.interface_number(),
+                        descriptor.setting_number(),
+                        endpoints,
+                        target_name,
+                    ) {
+                        Ok(Some(io)) => return Ok((io, endpoints)),
+                        Ok(None) => {}
+                        Err(err) => last_error = Some(err),
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            if saw_interface {
+                format!("classic KDUSB device found, but target '{target_name}' did not match NAME?")
+            } else {
+                "no supported classic KDUSB interface found".to_string()
+            },
+        ))
+    }
+
+    fn open_and_probe(
+        device: &Device<GlobalContext>,
+        interface: u8,
+        alternate_setting: u8,
+        endpoints: BulkEndpoints,
+        target_name: &str,
+    ) -> io::Result<Option<RusbBulkIo>> {
+        let handle = device
+            .open()
+            .map_err(|err| usb_error("opening classic KDUSB device", err))?;
+
+        match handle.kernel_driver_active(interface) {
+            Ok(true) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "KDUSB interface {interface} already has a kernel driver; refusing to detach it"
+                    ),
+                ));
+            }
+            Ok(false) | Err(rusb::Error::NotSupported) => {}
+            Err(err) => {
+                return Err(usb_error(
+                    "checking KDUSB interface kernel-driver ownership",
+                    err,
+                ));
+            }
+        }
+
+        handle
+            .claim_interface(interface)
+            .map_err(|err| usb_error("claiming KDUSB interface", err))?;
+
+        if alternate_setting != 0 {
+            handle
+                .set_alternate_setting(interface, alternate_setting)
+                .map_err(|err| usb_error("selecting KDUSB alternate setting", err))?;
+        }
+
+        let written = handle
+            .write_bulk(endpoints.output, NAME_PROBE, DISCOVERY_TIMEOUT)
+            .map_err(|err| usb_error("sending KDUSB NAME? probe", err))?;
+        if written != NAME_PROBE.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!(
+                    "short KDUSB NAME? probe: wrote {written} of {} bytes",
+                    NAME_PROBE.len()
+                ),
+            ));
+        }
+
+        let mut response = [0u8; NAME_RESPONSE_MAX];
+        let received = handle
+            .read_bulk(endpoints.input, &mut response, DISCOVERY_TIMEOUT)
+            .map_err(|err| usb_error("reading KDUSB NAME= reply", err))?;
+
+        if !name_response_matches(&response[..received], target_name)? {
+            return Ok(None);
+        }
+
+        Ok(Some(RusbBulkIo { handle }))
+    }
+
+    fn usb_error(context: &str, err: rusb::Error) -> io::Error {
+        let kind = match err {
+            rusb::Error::Access => io::ErrorKind::PermissionDenied,
+            rusb::Error::Busy => io::ErrorKind::WouldBlock,
+            rusb::Error::Interrupted => io::ErrorKind::Interrupted,
+            rusb::Error::InvalidParam => io::ErrorKind::InvalidInput,
+            rusb::Error::NoDevice => io::ErrorKind::NotConnected,
+            rusb::Error::NotFound => io::ErrorKind::NotFound,
+            rusb::Error::Overflow => io::ErrorKind::InvalidData,
+            rusb::Error::Pipe => io::ErrorKind::BrokenPipe,
+            rusb::Error::Timeout => io::ErrorKind::TimedOut,
+            _ => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, format!("{context}: {err}"))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn target_name_matches_windows_target_parser() {
+            for valid in ["A", "CLSA0102_USB", "DEBUG-1", "A0"] {
+                assert!(validate_requested_target_name(valid).is_ok(), "{valid}");
+            }
+            for invalid in ["", "lower", "BAD.NAME", "A+B", &"A".repeat(25)] {
+                assert!(validate_requested_target_name(invalid).is_err(), "{invalid}");
+            }
+        }
+
+        #[test]
+        fn inf_hardware_ids_are_recognised() {
+            for &(vendor, product) in KDUSB_HARDWARE_IDS {
+                assert!(is_known_hardware_id(vendor, product));
+            }
+            assert!(!is_known_hardware_id(0xffff, 0xffff));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::KdUsbStream;
 
 #[cfg(test)]
 mod tests {
