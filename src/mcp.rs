@@ -250,6 +250,7 @@ enum BackendArg {
     Kd,
     #[serde(rename = "kdnet")]
     KdNet,
+    KdUsb,
     Gdb,
     Memory,
     Dump,
@@ -258,11 +259,11 @@ enum BackendArg {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct OpenArgs {
     #[schemars(
-        description = "What to attach to: kd (KD over Unix socket), kdnet (KDNET over encrypted UDP), gdb (GDB remote stub), memory (physical memory only, no debug transport), or dump (a Windows kernel crash dump file)"
+        description = "What to attach to: kd (KD over Unix socket), kdnet (KDNET over encrypted UDP), kdusb (classic KD over physical USB, Linux), gdb (GDB remote stub), memory (physical memory only, no debug transport), or dump (a Windows kernel crash dump file)"
     )]
     backend: BackendArg,
     #[schemars(
-        description = "Connection target: Unix socket path for kd (default /tmp/ntoseye-kd.sock), listen address for kdnet (default 0.0.0.0:50000), host:port for gdb (default 127.0.0.1:1234), absolute .dmp path for dump (required). Not used by memory."
+        description = "Connection target: Unix socket path for kd (default /tmp/ntoseye-kd.sock), listen address for kdnet (default 0.0.0.0:50000), target name for kdusb (required), host:port for gdb (default 127.0.0.1:1234), absolute .dmp path for dump (required). Not used by memory."
     )]
     connect: Option<String>,
     #[schemars(
@@ -612,6 +613,7 @@ impl NtoseyeMcp {
                     backend: match live {
                         BackendArg::Kd => Backend::Kd,
                         BackendArg::KdNet => Backend::KdNet,
+                        BackendArg::KdUsb => Backend::KdUsb,
                         BackendArg::Gdb => Backend::Gdb,
                         BackendArg::Memory => Backend::Memory,
                         BackendArg::Dump => unreachable!("handled above"),
