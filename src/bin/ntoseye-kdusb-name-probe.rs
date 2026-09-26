@@ -88,7 +88,8 @@ mod linux {
         println!("REPLY_TARGET={}", report.target_name);
         println!("INTERFACE_RELEASED=true");
         println!("USB_CONTROL_TRANSFER=false");
-        println!("KD_PACKET_TRAFFIC=false");
+        println!("KD_PACKET_TX=false");
+        println!("TRAILING_RX_INTERPRETED=false");
         println!("BREAKIN_SENT=false");
         println!("DEBUGGER_SESSION=false");
         println!("TARGET_MEMORY_ACCESS=false");
