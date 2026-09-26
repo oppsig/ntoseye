@@ -115,7 +115,7 @@ impl Session {
                         Backend::Memory => Box::new(MemoryBackend::new()),
                         Backend::Kd | Backend::KdNet | Backend::KdUsb => {
                             unreachable!("matched above")
-                        },
+                        }
                     })
                 })
             }

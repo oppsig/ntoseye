@@ -100,11 +100,15 @@ impl TargetSpec {
             Backend::KdNet if kdnet_key.is_none() => {
                 return Err(invalid("kdnet backend requires a key"));
             }
-            Backend::Kd | Backend::KdUsb | Backend::Gdb | Backend::Memory if kdnet_key.is_some() => {
+            Backend::Kd | Backend::KdUsb | Backend::Gdb | Backend::Memory
+                if kdnet_key.is_some() =>
+            {
                 return Err(invalid("key is only valid for the kdnet backend"));
             }
             Backend::KdUsb if connect.as_deref().is_none_or(str::is_empty) => {
-                return Err(invalid("kdusb backend requires a target name via --connect"));
+                return Err(invalid(
+                    "kdusb backend requires a target name via --connect",
+                ));
             }
             Backend::Memory if connect.is_some() => {
                 return Err(invalid("memory backend does not use a connect endpoint"));

@@ -116,7 +116,6 @@ pub(crate) fn usb3_write_plan(len: usize, max_packet: usize) -> io::Result<Vec<u
     Ok(chunks)
 }
 
-
 pub(crate) trait BulkIo: Send + Sync {
     fn read_bulk(
         &self,
@@ -283,9 +282,9 @@ impl<I: BulkIo> std::io::Write for KdUsbStreamCore<I> {
         for count in plan {
             let end = offset + count;
             let chunk = &logical[offset..end];
-            let written =
-                self.io
-                    .write_bulk(self.endpoints.output, chunk, self.write_timeout)?;
+            let written = self
+                .io
+                .write_bulk(self.endpoints.output, chunk, self.write_timeout)?;
             if written != count {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -298,7 +297,6 @@ impl<I: BulkIo> std::io::Write for KdUsbStreamCore<I> {
         Ok(())
     }
 }
-
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -317,23 +315,13 @@ mod linux {
     }
 
     impl BulkIo for RusbBulkIo {
-        fn read_bulk(
-            &self,
-            endpoint: u8,
-            buf: &mut [u8],
-            timeout: Duration,
-        ) -> io::Result<usize> {
+        fn read_bulk(&self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
             self.handle
                 .read_bulk(endpoint, buf, timeout)
                 .map_err(|err| usb_error("KDUSB bulk read", err))
         }
 
-        fn write_bulk(
-            &self,
-            endpoint: u8,
-            buf: &[u8],
-            timeout: Duration,
-        ) -> io::Result<usize> {
+        fn write_bulk(&self, endpoint: u8, buf: &[u8], timeout: Duration) -> io::Result<usize> {
             self.handle
                 .write_bulk(endpoint, buf, timeout)
                 .map_err(|err| usb_error("KDUSB bulk write", err))
@@ -398,8 +386,7 @@ mod linux {
     }
 
     fn open_named_device(target_name: &str) -> io::Result<(RusbBulkIo, BulkEndpoints)> {
-        let devices =
-            rusb::devices().map_err(|err| usb_error("enumerating USB devices", err))?;
+        let devices = rusb::devices().map_err(|err| usb_error("enumerating USB devices", err))?;
         let mut saw_interface = false;
         let mut last_error = None;
 
@@ -445,8 +432,10 @@ mod linux {
                                 input = Some(endpoint.address());
                             }
                             Direction::Out if output.is_none() => {
-                                output =
-                                    Some((endpoint.address(), usize::from(endpoint.max_packet_size())));
+                                output = Some((
+                                    endpoint.address(),
+                                    usize::from(endpoint.max_packet_size()),
+                                ));
                             }
                             _ => {}
                         }
@@ -485,7 +474,9 @@ mod linux {
         Err(io::Error::new(
             io::ErrorKind::NotFound,
             if saw_interface {
-                format!("classic KDUSB device found, but target '{target_name}' did not match NAME?")
+                format!(
+                    "classic KDUSB device found, but target '{target_name}' did not match NAME?"
+                )
             } else {
                 "no supported classic KDUSB interface found".to_string()
             },
@@ -582,7 +573,10 @@ mod linux {
                 assert!(validate_requested_target_name(valid).is_ok(), "{valid}");
             }
             for invalid in ["", "lower", "BAD.NAME", "A+B", &"A".repeat(25)] {
-                assert!(validate_requested_target_name(invalid).is_err(), "{invalid}");
+                assert!(
+                    validate_requested_target_name(invalid).is_err(),
+                    "{invalid}"
+                );
             }
         }
 
@@ -625,12 +619,7 @@ mod tests {
     }
 
     impl BulkIo for MockBulkIo {
-        fn read_bulk(
-            &self,
-            endpoint: u8,
-            buf: &mut [u8],
-            timeout: Duration,
-        ) -> io::Result<usize> {
+        fn read_bulk(&self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
             self.read_requests
                 .lock()
                 .unwrap()
@@ -651,12 +640,7 @@ mod tests {
             Ok(bytes.len())
         }
 
-        fn write_bulk(
-            &self,
-            endpoint: u8,
-            buf: &[u8],
-            timeout: Duration,
-        ) -> io::Result<usize> {
+        fn write_bulk(&self, endpoint: u8, buf: &[u8], timeout: Duration) -> io::Result<usize> {
             self.write_requests
                 .lock()
                 .unwrap()
@@ -691,7 +675,10 @@ mod tests {
         assert_eq!(&rest, b"bcdefghij");
 
         let requests = stream.io.read_requests.lock().unwrap();
-        assert_eq!(requests.as_slice(), &[(0x81, USB_READ_REQUEST, Duration::from_millis(250))]);
+        assert_eq!(
+            requests.as_slice(),
+            &[(0x81, USB_READ_REQUEST, Duration::from_millis(250))]
+        );
     }
 
     #[test]
@@ -746,43 +733,54 @@ mod tests {
         let mut breakin = stream.try_clone().unwrap();
 
         stream.write_all(b"packet").unwrap();
-        breakin.write_all(&[crate::kd::framing::BREAKIN_BYTE]).unwrap();
+        breakin
+            .write_all(&[crate::kd::framing::BREAKIN_BYTE])
+            .unwrap();
         breakin.flush().unwrap();
         stream.flush().unwrap();
 
         let writes = stream.io.writes.lock().unwrap();
-        assert_eq!(writes.as_slice(), &[vec![crate::kd::framing::BREAKIN_BYTE], b"packet".to_vec()]);
+        assert_eq!(
+            writes.as_slice(),
+            &[vec![crate::kd::framing::BREAKIN_BYTE], b"packet".to_vec()]
+        );
     }
 
     #[test]
     fn stream_validates_endpoint_directions_and_packet_size() {
-        assert!(KdUsbStreamCore::new(
-            MockBulkIo::default(),
-            BulkEndpoints {
-                input: 0x01,
-                output: 0x02,
-                max_packet: 1024,
-            },
-        )
-        .is_err());
-        assert!(KdUsbStreamCore::new(
-            MockBulkIo::default(),
-            BulkEndpoints {
-                input: 0x81,
-                output: 0x82,
-                max_packet: 1024,
-            },
-        )
-        .is_err());
-        assert!(KdUsbStreamCore::new(
-            MockBulkIo::default(),
-            BulkEndpoints {
-                input: 0x81,
-                output: 0x01,
-                max_packet: 0,
-            },
-        )
-        .is_err());
+        assert!(
+            KdUsbStreamCore::new(
+                MockBulkIo::default(),
+                BulkEndpoints {
+                    input: 0x01,
+                    output: 0x02,
+                    max_packet: 1024,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            KdUsbStreamCore::new(
+                MockBulkIo::default(),
+                BulkEndpoints {
+                    input: 0x81,
+                    output: 0x82,
+                    max_packet: 1024,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            KdUsbStreamCore::new(
+                MockBulkIo::default(),
+                BulkEndpoints {
+                    input: 0x81,
+                    output: 0x01,
+                    max_packet: 0,
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -833,7 +831,10 @@ mod tests {
         let mut response = b"NAME=".to_vec();
         response.extend_from_slice(&[b'A'; TARGET_NAME_MAX]);
         response.extend_from_slice(&[0, 0]);
-        assert_eq!(parse_name_response(&response).unwrap().len(), TARGET_NAME_MAX);
+        assert_eq!(
+            parse_name_response(&response).unwrap().len(),
+            TARGET_NAME_MAX
+        );
 
         let mut too_long_name = b"NAME=".to_vec();
         too_long_name.extend_from_slice(&[b'A'; TARGET_NAME_MAX + 1]);

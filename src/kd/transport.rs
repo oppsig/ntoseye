@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
+use super::kdnet::KdNetStream;
 #[cfg(target_os = "linux")]
 use super::kdusb::KdUsbStream;
-use super::kdnet::KdNetStream;
 
-pub enum KdTransport {
+pub(crate) enum KdTransport {
     Serial(UnixStream),
     Network(KdNetStream),
     #[cfg(target_os = "linux")]
@@ -33,7 +33,7 @@ impl KdTransport {
             Self::Usb(stream) => {
                 stream.set_read_timeout(timeout);
                 Ok(())
-            },
+            }
         }
     }
 
