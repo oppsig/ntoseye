@@ -3,9 +3,10 @@
 //! Default mode preserves the original NAME?-only identity probe semantics.
 //! With `--accept-kd-prefetch`, the first non-empty bulk-IN transfer may
 //! instead be a plausible KD packet header from an already-active target.
-//! The observer never sends a KD ACK/RESEND/RESET packet, break-in byte, or
-//! debugger request. It performs exactly one NAME? bulk-OUT transaction and
-//! one non-empty bulk-IN observation before releasing the interface.
+//! With `--complete-kd-prefetch-tail`, an incomplete prefetched KD packet
+//! may consume exactly one additional non-empty bulk-IN transfer so its
+//! checksum/trailer boundary can be validated. The observer never sends a KD
+//! ACK/RESEND/RESET packet, break-in byte, or debugger request.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -67,6 +68,14 @@ mod linux {
             header: KdHeader,
             usb_rx_len: usize,
             raw_prefix_hex: String,
+            required_stream_bytes: usize,
+            tail_observation_performed: bool,
+            tail_usb_rx_len: usize,
+            tail_prefix_hex: String,
+            tail_extra_rx_len: usize,
+            packet_complete_after_tail: bool,
+            checksum_valid: bool,
+            trailer_valid: Option<bool>,
         },
     }
 
@@ -86,24 +95,32 @@ mod linux {
         let program = args
             .next()
             .unwrap_or_else(|| "ntoseye-kdusb-name-probe".to_string());
-        let expected = args
-            .next()
-            .ok_or_else(|| format!("usage: {program} <TARGET_NAME> [--accept-kd-prefetch]"))?;
+        let usage = || {
+            format!(
+                "usage: {program} <TARGET_NAME> [--accept-kd-prefetch] [--complete-kd-prefetch-tail]"
+            )
+        };
+        let expected = args.next().ok_or_else(&usage)?;
 
         let mut accept_kd_prefetch = false;
+        let mut complete_kd_prefetch_tail = false;
         for arg in args {
             match arg.as_str() {
                 "--accept-kd-prefetch" if !accept_kd_prefetch => accept_kd_prefetch = true,
-                _ => {
-                    return Err(format!(
-                        "usage: {program} <TARGET_NAME> [--accept-kd-prefetch]"
-                    ));
+                "--complete-kd-prefetch-tail" if !complete_kd_prefetch_tail => {
+                    complete_kd_prefetch_tail = true;
+                    accept_kd_prefetch = true;
                 }
+                _ => return Err(usage()),
             }
         }
 
         validate_target_name(&expected)?;
-        let report = probe(&expected, accept_kd_prefetch)?;
+        let report = probe(
+            &expected,
+            accept_kd_prefetch,
+            complete_kd_prefetch_tail,
+        )?;
 
         println!("KDUSB_NAME_PROBE=PASS");
         println!("VID_PID={:04x}:{:04x}", report.vendor, report.product);
@@ -135,6 +152,14 @@ mod linux {
                 header,
                 usb_rx_len,
                 raw_prefix_hex,
+                required_stream_bytes,
+                tail_observation_performed,
+                tail_usb_rx_len,
+                tail_prefix_hex,
+                tail_extra_rx_len,
+                packet_complete_after_tail,
+                checksum_valid,
+                trailer_valid,
             } => {
                 println!("BOOTSTRAP_KIND=KD_PREFETCH");
                 println!("USB_RX_TRANSFER_LEN={usb_rx_len}");
@@ -144,14 +169,21 @@ mod linux {
                 println!("KD_BYTE_COUNT={}", header.byte_count);
                 println!("KD_PACKET_ID=0x{:08x}", header.packet_id);
                 println!("KD_CHECKSUM=0x{:08x}", header.checksum);
-                println!(
-                    "KD_REQUIRED_STREAM_BYTES={}",
-                    KD_HEADER_SIZE + usize::from(header.byte_count) + 1
-                );
+                println!("KD_REQUIRED_STREAM_BYTES={required_stream_bytes}");
                 println!(
                     "KD_PACKET_COMPLETE_IN_FIRST_TRANSFER={}",
-                    usb_rx_len >= KD_HEADER_SIZE + usize::from(header.byte_count) + 1
+                    usb_rx_len >= required_stream_bytes
                 );
+                println!("KD_CHECKSUM_VALID={checksum_valid}");
+                println!("TAIL_OBSERVATION_PERFORMED={tail_observation_performed}");
+                println!("TAIL_USB_RX_TRANSFER_LEN={tail_usb_rx_len}");
+                println!("TAIL_RX_PREFIX_HEX={tail_prefix_hex}");
+                println!("TAIL_EXTRA_RX_LEN={tail_extra_rx_len}");
+                println!("KD_PACKET_COMPLETE_AFTER_TAIL_OBSERVATION={packet_complete_after_tail}");
+                match trailer_valid {
+                    Some(valid) => println!("KD_TRAILER_VALID={valid}"),
+                    None => println!("KD_TRAILER_VALID=NA"),
+                }
                 println!("RAW_RX_PREFIX_HEX={raw_prefix_hex}");
             }
         }
@@ -181,7 +213,11 @@ mod linux {
         }
     }
 
-    fn probe(expected: &str, accept_kd_prefetch: bool) -> Result<ProbeReport, String> {
+    fn probe(
+        expected: &str,
+        accept_kd_prefetch: bool,
+        complete_kd_prefetch_tail: bool,
+    ) -> Result<ProbeReport, String> {
         let devices = rusb::devices().map_err(|err| format!("enumerating USB devices: {err}"))?;
         let mut saw_interface = false;
         let mut last_error = None;
@@ -248,6 +284,7 @@ mod linux {
                         max_packet,
                         expected,
                         accept_kd_prefetch,
+                        complete_kd_prefetch_tail,
                     ) {
                         Ok(Some(report)) => return Ok(report),
                         Ok(None) => {}
@@ -280,6 +317,7 @@ mod linux {
         max_packet: u16,
         expected: &str,
         accept_kd_prefetch: bool,
+        complete_kd_prefetch_tail: bool,
     ) -> Result<Option<ProbeReport>, String> {
         let handle = device
             .open()
@@ -369,10 +407,67 @@ mod linux {
                         "{err}; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
                     )
                 })?;
+
+                let required_stream_bytes = kd_required_stream_bytes(header);
+                let mut packet_prefix = transfer.to_vec();
+                let mut tail_observation_performed = false;
+                let mut tail_usb_rx_len = 0usize;
+                let mut tail_prefix_hex = String::new();
+                let mut tail_extra_rx_len = 0usize;
+
+                if complete_kd_prefetch_tail && packet_prefix.len() < required_stream_bytes {
+                    tail_observation_performed = true;
+                    let mut tail = vec![0u8; USB_READ_REQUEST];
+                    tail_usb_rx_len = loop {
+                        let count = handle
+                            .read_bulk(bulk_in, &mut tail, TIMEOUT)
+                            .map_err(|err| format!("reading KDUSB prefetched packet tail: {err}"))?;
+                        if count != 0 {
+                            break count;
+                        }
+                    };
+
+                    let tail_prefix_len = tail_usb_rx_len.min(64);
+                    tail_prefix_hex = hex::encode(&tail[..tail_prefix_len]);
+                    let missing = required_stream_bytes - packet_prefix.len();
+                    if tail_usb_rx_len < missing {
+                        return Err(format!(
+                            "second KDUSB bulk-IN transfer still does not complete prefetched KD packet: need {missing} bytes, received {tail_usb_rx_len}"
+                        ));
+                    }
+
+                    packet_prefix.extend_from_slice(&tail[..missing]);
+                    tail_extra_rx_len = tail_usb_rx_len - missing;
+                }
+
+                let packet_complete_after_tail = packet_prefix.len() >= required_stream_bytes;
+                let checksum_valid = kd_checksum_valid(header, &packet_prefix);
+                let trailer_valid = kd_trailer_valid(header, &packet_prefix);
+
+                if complete_kd_prefetch_tail {
+                    if !packet_complete_after_tail {
+                        return Err("prefetched KD packet remains incomplete after bounded tail observation".to_string());
+                    }
+                    if !checksum_valid {
+                        return Err("prefetched KD packet checksum does not match header".to_string());
+                    }
+                    if trailer_valid == Some(false) {
+                        return Err("prefetched KD data packet trailer is not 0xAA".to_string());
+                    }
+                }
+
                 BootstrapObservation::KdPrefetch {
                     header,
                     usb_rx_len: received,
                     raw_prefix_hex,
+                    required_stream_bytes,
+                    tail_observation_performed,
+                    tail_usb_rx_len,
+                    tail_prefix_hex,
+                    tail_extra_rx_len,
+                    packet_complete_after_tail,
+                    checksum_valid,
+                    trailer_valid,
                 }
             } else {
                 return Err(format!(
@@ -443,6 +538,38 @@ mod linux {
         }
     }
 
+    fn kd_required_stream_bytes(header: KdHeader) -> usize {
+        match header.leader {
+            DATA_PACKET_LEADER => KD_HEADER_SIZE + usize::from(header.byte_count) + 1,
+            CONTROL_PACKET_LEADER => KD_HEADER_SIZE,
+            _ => unreachable!("header was already classified as plausible"),
+        }
+    }
+
+    fn kd_checksum_valid(header: KdHeader, packet: &[u8]) -> bool {
+        if header.leader == CONTROL_PACKET_LEADER {
+            return header.byte_count == 0 && header.checksum == 0 && packet.len() >= KD_HEADER_SIZE;
+        }
+
+        let payload_end = KD_HEADER_SIZE + usize::from(header.byte_count);
+        if packet.len() < payload_end {
+            return false;
+        }
+        packet[KD_HEADER_SIZE..payload_end]
+            .iter()
+            .fold(0u32, |sum, &byte| sum.wrapping_add(u32::from(byte)))
+            == header.checksum
+    }
+
+    fn kd_trailer_valid(header: KdHeader, packet: &[u8]) -> Option<bool> {
+        if header.leader != DATA_PACKET_LEADER {
+            return None;
+        }
+
+        let trailer_index = KD_HEADER_SIZE + usize::from(header.byte_count);
+        packet.get(trailer_index).map(|&byte| byte == 0xaa)
+    }
+
     fn parse_name_response(response: &[u8]) -> Result<&str, String> {
         if response.len() < NAME_PREFIX.len() || response.len() > NAME_RESPONSE_MAX {
             return Err(format!(
@@ -498,6 +625,45 @@ mod linux {
             assert_eq!(header.byte_count, 146);
             assert_eq!(header.packet_id, 0x8080_0800);
             assert_eq!(header.checksum, 0x0000_11a0);
+        }
+
+        #[test]
+        fn observed_prefetch_requires_one_trailer_byte() {
+            let mut observed = hex::decode(
+                "303030300b00920000088080a0110000303400000000000089001200800000000100000001000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+            observed.resize(162, 0);
+            let header = parse_plausible_kd_header(&observed).unwrap();
+            assert_eq!(kd_required_stream_bytes(header), 163);
+            assert!(!kd_trailer_valid(header, &observed).unwrap_or(false));
+            observed.push(0xaa);
+            assert_eq!(kd_trailer_valid(header, &observed), Some(true));
+        }
+
+        #[test]
+        fn checksum_validator_accepts_synthetic_data_packet() {
+            let payload = b"abc";
+            let checksum = payload
+                .iter()
+                .fold(0u32, |sum, &byte| sum.wrapping_add(u32::from(byte)));
+            let header = KdHeader {
+                leader: DATA_PACKET_LEADER,
+                packet_type: 3,
+                byte_count: payload.len() as u16,
+                packet_id: 0x8080_0000,
+                checksum,
+            };
+            let mut packet = Vec::new();
+            packet.extend_from_slice(&header.leader.to_le_bytes());
+            packet.extend_from_slice(&header.packet_type.to_le_bytes());
+            packet.extend_from_slice(&header.byte_count.to_le_bytes());
+            packet.extend_from_slice(&header.packet_id.to_le_bytes());
+            packet.extend_from_slice(&header.checksum.to_le_bytes());
+            packet.extend_from_slice(payload);
+            packet.push(0xaa);
+            assert!(kd_checksum_valid(header, &packet));
+            assert_eq!(kd_trailer_valid(header, &packet), Some(true));
         }
 
         #[test]
