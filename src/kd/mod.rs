@@ -61,6 +61,8 @@ mod handles;
 mod hw_breakpoints;
 pub mod hwbp;
 mod kdnet;
+#[allow(dead_code)]
+mod kdusb;
 mod memory;
 mod pump;
 mod registers;
