@@ -6,9 +6,7 @@
 
 use std::io;
 
-use super::framing::{
-    CONTROL_PACKET_LEADER, DATA_PACKET_LEADER, HEADER_SIZE, Header, PACKET_MAX_SIZE,
-};
+use super::framing::{CONTROL_PACKET_LEADER, DATA_PACKET_LEADER, Header, PACKET_MAX_SIZE};
 
 pub(crate) const KDUSB_VENDOR_ID: u16 = 0x3495;
 pub(crate) const KDUSB_PRODUCT_ID: u16 = 0x00e0;
@@ -103,7 +101,7 @@ fn classify_bootstrap_transfer(response: &[u8], expected: &str) -> io::Result<Bo
         Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "KDUSB bootstrap transfer is neither NAME= nor plausible KD framing                  (leader={:#010x}, type={}, byte_count={})",
+                "KDUSB bootstrap transfer is neither NAME= nor plausible KD framing (leader={:#010x}, type={}, byte_count={})",
                 header.leader, header.packet_type, header.byte_count
             ),
         ))
@@ -593,7 +591,7 @@ mod linux {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "{kd_fallback_count} active classic KDUSB devices emitted KD traffic before                      NAME=; target '{target_name}' is ambiguous"
+                    "{kd_fallback_count} active classic KDUSB devices emitted KD traffic before NAME=; target '{target_name}' is ambiguous"
                 ),
             ));
         }
