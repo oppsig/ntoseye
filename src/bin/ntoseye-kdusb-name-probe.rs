@@ -1,10 +1,11 @@
-//! One-shot classic KDUSB NAME? identity probe.
+//! One-shot classic KDUSB bootstrap observer.
 //!
-//! This binary is deliberately narrower than the ntoseye KDUSB backend:
-//! it opens one supported classic-KDUSB interface, claims it, sends exactly
-//! the five-byte ASCII probe "NAME?", reads one NAME= reply, releases the
-//! interface, and exits. It never constructs KD framing, sends a break-in,
-//! starts a debugger session, or accesses target memory.
+//! Default mode preserves the original NAME?-only identity probe semantics.
+//! With `--accept-kd-prefetch`, the first non-empty bulk-IN transfer may
+//! instead be a plausible KD packet header from an already-active target.
+//! The observer never sends a KD ACK/RESEND/RESET packet, break-in byte, or
+//! debugger request. It performs exactly one NAME? bulk-OUT transaction and
+//! one non-empty bulk-IN observation before releasing the interface.
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -40,7 +41,34 @@ mod linux {
     const NAME_RESPONSE_MAX: usize = 37;
     const TARGET_NAME_MAX: usize = 24;
     const USB_READ_REQUEST: usize = 0x0fb0;
+    const KD_PACKET_MAX: usize = 4000;
+    const KD_HEADER_SIZE: usize = 16;
+    const DATA_PACKET_LEADER: u32 = 0x3030_3030;
+    const CONTROL_PACKET_LEADER: u32 = 0x6969_6969;
     const TIMEOUT: Duration = Duration::from_secs(1);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct KdHeader {
+        leader: u32,
+        packet_type: u16,
+        byte_count: u16,
+        packet_id: u32,
+        checksum: u32,
+    }
+
+    enum BootstrapObservation {
+        Name {
+            reply: Vec<u8>,
+            usb_rx_len: usize,
+            trailing_rx_len: usize,
+            target_name: String,
+        },
+        KdPrefetch {
+            header: KdHeader,
+            usb_rx_len: usize,
+            raw_prefix_hex: String,
+        },
+    }
 
     struct ProbeReport {
         vendor: u16,
@@ -50,10 +78,7 @@ mod linux {
         bulk_in: u8,
         bulk_out: u8,
         max_packet: u16,
-        reply: Vec<u8>,
-        usb_rx_len: usize,
-        trailing_rx_len: usize,
-        target_name: String,
+        observation: BootstrapObservation,
     }
 
     pub fn run() -> Result<(), String> {
@@ -63,13 +88,22 @@ mod linux {
             .unwrap_or_else(|| "ntoseye-kdusb-name-probe".to_string());
         let expected = args
             .next()
-            .ok_or_else(|| format!("usage: {program} <TARGET_NAME>"))?;
-        if args.next().is_some() {
-            return Err(format!("usage: {program} <TARGET_NAME>"));
-        }
-        validate_target_name(&expected)?;
+            .ok_or_else(|| format!("usage: {program} <TARGET_NAME> [--accept-kd-prefetch]"))?;
 
-        let report = probe(&expected)?;
+        let mut accept_kd_prefetch = false;
+        for arg in args {
+            match arg.as_str() {
+                "--accept-kd-prefetch" if !accept_kd_prefetch => accept_kd_prefetch = true,
+                _ => {
+                    return Err(format!(
+                        "usage: {program} <TARGET_NAME> [--accept-kd-prefetch]"
+                    ));
+                }
+            }
+        }
+
+        validate_target_name(&expected)?;
+        let report = probe(&expected, accept_kd_prefetch)?;
 
         println!("KDUSB_NAME_PROBE=PASS");
         println!("VID_PID={:04x}:{:04x}", report.vendor, report.product);
@@ -81,15 +115,53 @@ mod linux {
         println!("PROBE_TX_LEN={}", NAME_PROBE.len());
         println!("PROBE_TX_HEX={}", hex::encode(NAME_PROBE));
         println!("USB_RX_REQUEST_LEN={USB_READ_REQUEST}");
-        println!("USB_RX_TRANSFER_LEN={}", report.usb_rx_len);
-        println!("REPLY_RX_LEN={}", report.reply.len());
-        println!("REPLY_RX_HEX={}", hex::encode(&report.reply));
-        println!("TRAILING_RX_LEN={}", report.trailing_rx_len);
-        println!("REPLY_TARGET={}", report.target_name);
+
+        match report.observation {
+            BootstrapObservation::Name {
+                reply,
+                usb_rx_len,
+                trailing_rx_len,
+                target_name,
+            } => {
+                println!("BOOTSTRAP_KIND=NAME");
+                println!("USB_RX_TRANSFER_LEN={usb_rx_len}");
+                println!("REPLY_RX_LEN={}", reply.len());
+                println!("REPLY_RX_HEX={}", hex::encode(&reply));
+                println!("TRAILING_RX_LEN={trailing_rx_len}");
+                println!("REPLY_TARGET={target_name}");
+                println!("KD_PREFETCH=false");
+            }
+            BootstrapObservation::KdPrefetch {
+                header,
+                usb_rx_len,
+                raw_prefix_hex,
+            } => {
+                println!("BOOTSTRAP_KIND=KD_PREFETCH");
+                println!("USB_RX_TRANSFER_LEN={usb_rx_len}");
+                println!("KD_PREFETCH=true");
+                println!("KD_LEADER=0x{:08x}", header.leader);
+                println!("KD_PACKET_TYPE=0x{:04x}", header.packet_type);
+                println!("KD_BYTE_COUNT={}", header.byte_count);
+                println!("KD_PACKET_ID=0x{:08x}", header.packet_id);
+                println!("KD_CHECKSUM=0x{:08x}", header.checksum);
+                println!(
+                    "KD_REQUIRED_STREAM_BYTES={}",
+                    KD_HEADER_SIZE + usize::from(header.byte_count) + 1
+                );
+                println!(
+                    "KD_PACKET_COMPLETE_IN_FIRST_TRANSFER={}",
+                    usb_rx_len >= KD_HEADER_SIZE + usize::from(header.byte_count) + 1
+                );
+                println!("RAW_RX_PREFIX_HEX={raw_prefix_hex}");
+            }
+        }
+
         println!("INTERFACE_RELEASED=true");
         println!("USB_CONTROL_TRANSFER=false");
         println!("KD_PACKET_TX=false");
-        println!("TRAILING_RX_INTERPRETED=false");
+        println!("KD_ACK_TX=false");
+        println!("KD_RESEND_TX=false");
+        println!("KD_RESET_TX=false");
         println!("BREAKIN_SENT=false");
         println!("DEBUGGER_SESSION=false");
         println!("TARGET_MEMORY_ACCESS=false");
@@ -109,7 +181,7 @@ mod linux {
         }
     }
 
-    fn probe(expected: &str) -> Result<ProbeReport, String> {
+    fn probe(expected: &str, accept_kd_prefetch: bool) -> Result<ProbeReport, String> {
         let devices = rusb::devices().map_err(|err| format!("enumerating USB devices: {err}"))?;
         let mut saw_interface = false;
         let mut last_error = None;
@@ -175,6 +247,7 @@ mod linux {
                         bulk_out,
                         max_packet,
                         expected,
+                        accept_kd_prefetch,
                     ) {
                         Ok(Some(report)) => return Ok(report),
                         Ok(None) => {}
@@ -188,7 +261,7 @@ mod linux {
             Err(err)
         } else if saw_interface {
             Err(format!(
-                "classic KDUSB interface found, but NAME= reply did not match '{expected}'"
+                "classic KDUSB interface found, but bootstrap did not match target '{expected}'"
             ))
         } else {
             Err("no supported classic KDUSB dc/02/ff interface found".to_string())
@@ -206,6 +279,7 @@ mod linux {
         bulk_out: u8,
         max_packet: u16,
         expected: &str,
+        accept_kd_prefetch: bool,
     ) -> Result<Option<ProbeReport>, String> {
         let handle = device
             .open()
@@ -250,51 +324,61 @@ mod linux {
                 ));
             }
 
-            // USB2DBG posts a 4016-byte USB receive and presents the result as
-            // a byte stream to its caller. A raw libusb buffer sized only to
-            // the <=37-byte logical NAME reply can overflow when the device
-            // completes a larger USB transfer. Match the recovered Windows
-            // receive quantum, then validate only the logical NAME response.
             let mut response = vec![0u8; USB_READ_REQUEST];
-            let received = handle
-                .read_bulk(bulk_in, &mut response, TIMEOUT)
-                .map_err(|err| format!("reading KDUSB NAME= reply: {err}"))?;
-
-            let logical_len = NAME_PREFIX.len() + expected.len() + 2;
-            if logical_len > NAME_RESPONSE_MAX {
-                return Err(format!(
-                    "expected NAME reply length {logical_len} exceeds logical maximum {NAME_RESPONSE_MAX}"
-                ));
-            }
-            if received < logical_len {
-                return Err(format!(
-                    "short KDUSB NAME= reply: received {received} bytes, need at least {logical_len}"
-                ));
-            }
-
+            let received = loop {
+                let count = handle
+                    .read_bulk(bulk_in, &mut response, TIMEOUT)
+                    .map_err(|err| format!("reading KDUSB bootstrap transfer: {err}"))?;
+                if count != 0 {
+                    break count;
+                }
+            };
+            let transfer = &response[..received];
             let raw_prefix_len = received.min(64);
-            let raw_prefix_hex = hex::encode(&response[..raw_prefix_len]);
+            let raw_prefix_hex = hex::encode(&transfer[..raw_prefix_len]);
 
-            if !response[..received].starts_with(NAME_PREFIX) {
+            let observation = if transfer.starts_with(NAME_PREFIX) {
+                let limit = received.min(NAME_RESPONSE_MAX);
+                let suffix = &transfer[NAME_PREFIX.len()..limit];
+                let nul = suffix.iter().position(|&byte| byte == 0).ok_or_else(|| {
+                    format!(
+                        "KDUSB NAME response is not NUL terminated within {NAME_RESPONSE_MAX} bytes; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
+                    )
+                })?;
+                let logical_end = NAME_PREFIX.len() + nul + 1;
+                let consumed = if transfer.get(logical_end) == Some(&0) {
+                    logical_end + 1
+                } else {
+                    logical_end
+                };
+                let reply = transfer[..consumed].to_vec();
+                let target_name = parse_name_response(&reply)?.to_string();
+                if target_name != expected {
+                    return Ok(None);
+                }
+
+                BootstrapObservation::Name {
+                    reply,
+                    usb_rx_len: received,
+                    trailing_rx_len: received - consumed,
+                    target_name,
+                }
+            } else if accept_kd_prefetch {
+                let header = parse_plausible_kd_header(transfer).map_err(|err| {
+                    format!(
+                        "{err}; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
+                    )
+                })?;
+                BootstrapObservation::KdPrefetch {
+                    header,
+                    usb_rx_len: received,
+                    raw_prefix_hex,
+                }
+            } else {
                 return Err(format!(
                     "KDUSB NAME response is missing NAME= prefix; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
                 ));
-            }
-
-            let reply = response[..logical_len].to_vec();
-            let target_name = parse_name_response(&reply)
-                .map_err(|err| {
-                    format!(
-                        "{err}; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
-                    )
-                })?
-                .to_string();
-
-            if target_name != expected || reply[logical_len - 2..] != [0, 0] {
-                return Err(format!(
-                    "KDUSB NAME reply did not match expected target '{expected}'; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
-                ));
-            }
+            };
 
             Ok(Some(ProbeReport {
                 vendor,
@@ -304,10 +388,7 @@ mod linux {
                 bulk_in,
                 bulk_out,
                 max_packet,
-                reply,
-                usb_rx_len: received,
-                trailing_rx_len: received - logical_len,
-                target_name,
+                observation,
             }))
         })();
 
@@ -320,6 +401,45 @@ mod linux {
             (Err(err), Ok(())) => Err(err),
             (Ok(_), Err(release)) => Err(release),
             (Err(err), Err(release)) => Err(format!("{err}; additionally {release}")),
+        }
+    }
+
+    fn parse_plausible_kd_header(response: &[u8]) -> Result<KdHeader, String> {
+        if response.len() < KD_HEADER_SIZE {
+            return Err(format!(
+                "KDUSB bootstrap transfer is neither NAME= nor a complete KD header ({} bytes)",
+                response.len()
+            ));
+        }
+
+        let header = KdHeader {
+            leader: u32::from_le_bytes(response[0..4].try_into().expect("fixed header slice")),
+            packet_type: u16::from_le_bytes(response[4..6].try_into().expect("fixed header slice")),
+            byte_count: u16::from_le_bytes(response[6..8].try_into().expect("fixed header slice")),
+            packet_id: u32::from_le_bytes(response[8..12].try_into().expect("fixed header slice")),
+            checksum: u32::from_le_bytes(response[12..16].try_into().expect("fixed header slice")),
+        };
+
+        let plausible = match header.leader {
+            DATA_PACKET_LEADER => {
+                (1..=11).contains(&header.packet_type)
+                    && usize::from(header.byte_count) <= KD_PACKET_MAX
+            }
+            CONTROL_PACKET_LEADER => {
+                matches!(header.packet_type, 4..=6)
+                    && header.byte_count == 0
+                    && header.checksum == 0
+            }
+            _ => false,
+        };
+
+        if plausible {
+            Ok(header)
+        } else {
+            Err(format!(
+                "KDUSB bootstrap transfer is neither NAME= nor plausible KD framing (leader={:#010x}, type={}, byte_count={})",
+                header.leader, header.packet_type, header.byte_count
+            ))
         }
     }
 
@@ -364,6 +484,25 @@ mod linux {
         fn exact_clsa0102_reply_parses() {
             let reply = b"NAME=CLSA0102_USB\0\0";
             assert_eq!(parse_name_response(reply).unwrap(), "CLSA0102_USB");
+        }
+
+        #[test]
+        fn observed_live_file_io_header_is_accepted_as_kd_prefetch() {
+            let observed = hex::decode(
+                "303030300b00920000088080a0110000303400000000000089001200800000000100000001000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+            let header = parse_plausible_kd_header(&observed).unwrap();
+            assert_eq!(header.leader, DATA_PACKET_LEADER);
+            assert_eq!(header.packet_type, 11);
+            assert_eq!(header.byte_count, 146);
+            assert_eq!(header.packet_id, 0x8080_0800);
+            assert_eq!(header.checksum, 0x0000_11a0);
+        }
+
+        #[test]
+        fn random_non_name_non_kd_transfer_is_rejected() {
+            assert!(parse_plausible_kd_header(&[0x55; 32]).is_err());
         }
 
         #[test]
