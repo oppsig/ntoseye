@@ -13,6 +13,8 @@ pub enum Backend {
     Kd,
     /// KD over UDP (KDNET); needs a key.
     KdNet,
+    /// Classic Microsoft KD over a physical USB debug connection.
+    KdUsb,
     /// QEMU GDB stub.
     Gdb,
     /// Passive host-memory introspection, no debug transport.
@@ -24,6 +26,7 @@ impl Backend {
         match self {
             Self::Kd => "kd",
             Self::KdNet => "kdnet",
+            Self::KdUsb => "kdusb",
             Self::Gdb => "gdb",
             Self::Memory => "memory",
         }
@@ -35,6 +38,7 @@ impl Backend {
         match self {
             Self::Kd => Some(DEFAULT_KD_SOCKET),
             Self::KdNet => Some(DEFAULT_KDNET_ADDR),
+            Self::KdUsb => None,
             Self::Gdb => Some(DEFAULT_GDB_ADDR),
             Self::Memory => None,
         }
@@ -48,10 +52,11 @@ impl std::str::FromStr for Backend {
         match value {
             "kd" => Ok(Self::Kd),
             "kdnet" => Ok(Self::KdNet),
+            "kdusb" => Ok(Self::KdUsb),
             "gdb" => Ok(Self::Gdb),
             "memory" => Ok(Self::Memory),
             other => Err(format!(
-                "unknown backend '{other}': expected 'kd', 'kdnet', 'gdb', or 'memory'"
+                "unknown backend '{other}': expected 'kd', 'kdnet', 'kdusb', 'gdb', or 'memory'"
             )),
         }
     }
@@ -95,19 +100,26 @@ impl TargetSpec {
             Backend::KdNet if kdnet_key.is_none() => {
                 return Err(invalid("kdnet backend requires a key"));
             }
-            Backend::Kd | Backend::Gdb | Backend::Memory if kdnet_key.is_some() => {
+            Backend::Kd | Backend::KdUsb | Backend::Gdb | Backend::Memory if kdnet_key.is_some() => {
                 return Err(invalid("key is only valid for the kdnet backend"));
+            }
+            Backend::KdUsb if connect.as_deref().is_none_or(str::is_empty) => {
+                return Err(invalid("kdusb backend requires a target name via --connect"));
             }
             Backend::Memory if connect.is_some() => {
                 return Err(invalid("memory backend does not use a connect endpoint"));
             }
             _ => {}
         }
-        if !matches!(backend, Backend::Kd | Backend::KdNet)
+        #[cfg(not(target_os = "linux"))]
+        if matches!(backend, Backend::KdUsb) {
+            return Err(invalid("kdusb backend is only supported on Linux hosts"));
+        }
+        if !matches!(backend, Backend::Kd | Backend::KdNet | Backend::KdUsb)
             && *memory_source != kd::KdMemorySource::Auto
         {
             return Err(invalid(
-                "memory_source is only valid for kd and kdnet backends",
+                "memory_source is only valid for kd, kdnet, and kdusb backends",
             ));
         }
         Ok(())
