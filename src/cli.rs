@@ -53,13 +53,13 @@ struct Cli {
 #[derive(Args)]
 struct TargetOptions {
     /// Debugger backend: 'kd' (Windows KD over serial, default), 'kdnet'
-    /// (Windows KD over UDP), 'gdb' (QEMU GDB stub), or 'memory' (passive
-    /// live-VM introspection)
+    /// (Windows KD over UDP), 'kdusb' (classic KD over physical USB, Linux),
+    /// 'gdb' (QEMU GDB stub), or 'memory' (passive live-VM introspection)
     #[arg(short = 'b', long, global = true)]
     backend: Option<Backend>,
 
-    /// Backend target: GDB address, KD socket path, or KDNET listen address;
-    /// unused by memory
+    /// Backend target: GDB address, KD socket path, KDNET listen address, or
+    /// KDUSB target name; unused by memory
     #[arg(long, global = true)]
     connect: Option<String>,
 
@@ -68,7 +68,7 @@ struct TargetOptions {
     #[arg(long, global = true)]
     kdnet_key: Option<String>,
 
-    /// KD/KDNET memory source: auto (validated host memory, then KD
+    /// KD/KDNET/KDUSB memory source: auto (validated host memory, then KD
     /// fallback), host, or kd
     #[arg(long, global = true)]
     memory_source: Option<KdMemorySource>,
@@ -300,9 +300,11 @@ fn run(cli: Cli) -> Result<()> {
             "--kdnet-key is only valid with --backend kdnet".to_string(),
         ));
     }
-    if !matches!(backend, Backend::Kd | Backend::KdNet) && args.memory_source.is_some() {
+    if !matches!(backend, Backend::Kd | Backend::KdNet | Backend::KdUsb)
+        && args.memory_source.is_some()
+    {
         return Err(Error::DebugInfo(
-            "--memory-source is only valid with --backend kd or --backend kdnet".to_string(),
+            "--memory-source is only valid with --backend kd, kdnet, or kdusb".to_string(),
         ));
     }
     // A protocol server may start without a target and be pointed at one by
