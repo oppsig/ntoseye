@@ -1089,10 +1089,7 @@ mod tests {
             }))
             .await
             .unwrap_err();
-        assert!(
-            err.message.contains("requires a target name"),
-            "{err:?}"
-        );
+        assert!(err.message.contains("requires a target name"), "{err:?}");
 
         let err = mcp
             .open(Parameters(OpenArgs {

@@ -201,7 +201,6 @@ pub mod unwind;
 #[cfg(any(feature = "mcp", feature = "python"))]
 pub mod view;
 
-
 #[cfg(test)]
 mod backend_contract_tests {
     use super::{Backend, TargetSpec};
@@ -223,7 +222,9 @@ mod backend_contract_tests {
             kdnet_key: None,
             memory_source: KdMemorySource::Auto,
         };
-        let error = missing.validate().expect_err("missing target name must fail");
+        let error = missing
+            .validate()
+            .expect_err("missing target name must fail");
         assert!(
             error.to_string().contains("requires a target name"),
             "{error}"
@@ -257,7 +258,9 @@ mod backend_contract_tests {
         };
         let error = keyed.validate().expect_err("KDNET key must be rejected");
         assert!(
-            error.to_string().contains("only valid for the kdnet backend"),
+            error
+                .to_string()
+                .contains("only valid for the kdnet backend"),
             "{error}"
         );
     }
