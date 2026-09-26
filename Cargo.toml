@@ -75,6 +75,7 @@ gdbstub = { version = "0.7.10", default-features = false, features = ["std"], op
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.3", features = [ "process", "uio" ] }
+rusb = "0.9.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
