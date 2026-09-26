@@ -521,6 +521,7 @@ mod linux {
         Ok(())
     }
 
+    #[cfg(test)]
     fn parse_name_transfer(transfer: &[u8]) -> Result<(&str, usize), String> {
         if !transfer.starts_with(NAME_PREFIX) {
             return Err("KDUSB bootstrap transfer is missing NAME= prefix".to_string());
