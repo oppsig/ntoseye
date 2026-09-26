@@ -8,7 +8,7 @@ use super::kdnet::KdNetStream;
 #[cfg(target_os = "linux")]
 use super::kdusb::KdUsbStream;
 
-pub(crate) enum KdTransport {
+pub enum KdTransport {
     Serial(UnixStream),
     Network(KdNetStream),
     #[cfg(target_os = "linux")]

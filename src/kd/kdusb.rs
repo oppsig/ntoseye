@@ -306,7 +306,7 @@ mod linux {
 
     const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 
-    pub(crate) struct KdUsbStream {
+    pub struct KdUsbStream {
         inner: KdUsbStreamCore<RusbBulkIo>,
     }
 
