@@ -100,7 +100,7 @@ mod linux {
                 "usage: {program} <TARGET_NAME> [--accept-kd-prefetch] [--complete-kd-prefetch-tail]"
             )
         };
-        let expected = args.next().ok_or_else(&usage)?;
+        let expected = args.next().ok_or_else(|| usage())?;
 
         let mut accept_kd_prefetch = false;
         let mut complete_kd_prefetch_tail = false;
@@ -179,7 +179,9 @@ mod linux {
                 println!("TAIL_USB_RX_TRANSFER_LEN={tail_usb_rx_len}");
                 println!("TAIL_RX_PREFIX_HEX={tail_prefix_hex}");
                 println!("TAIL_EXTRA_RX_LEN={tail_extra_rx_len}");
-                println!("KD_PACKET_COMPLETE_AFTER_TAIL_OBSERVATION={packet_complete_after_tail}");
+                println!(
+                    "KD_PACKET_COMPLETE_AFTER_TAIL_OBSERVATION={packet_complete_after_tail}"
+                );
                 match trailer_valid {
                     Some(valid) => println!("KD_TRAILER_VALID={valid}"),
                     None => println!("KD_TRAILER_VALID=NA"),
@@ -446,7 +448,10 @@ mod linux {
 
                 if complete_kd_prefetch_tail {
                     if !packet_complete_after_tail {
-                        return Err("prefetched KD packet remains incomplete after bounded tail observation".to_string());
+                        return Err(
+                            "prefetched KD packet remains incomplete after bounded tail observation"
+                                .to_string(),
+                        );
                     }
                     if !checksum_valid {
                         return Err("prefetched KD packet checksum does not match header".to_string());
