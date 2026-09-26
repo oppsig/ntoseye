@@ -47,7 +47,7 @@ impl Session {
     /// backend selection, endpoint defaults, and instance locking cannot
     /// drift between them.
     ///
-    /// kd/kdnet/gdb take a per-target instance lock before building the
+    /// kd/kdnet/kdusb/gdb take a per-target instance lock before building the
     /// backend, so a second attach against the same resource fails fast rather
     /// than racing on the handshake; dumps and passive memory are read-only
     /// and coexist with anything.
@@ -70,12 +70,14 @@ impl Session {
                 Self::connect(phys, None, || Ok(Box::new(DmpBackend::new(&info))))
             }
             TargetSpec::Live {
-                backend: backend @ (Backend::Kd | Backend::KdNet),
+                backend: backend @ (Backend::Kd | Backend::KdNet | Backend::KdUsb),
                 kdnet_key,
                 memory_source,
                 ..
             } => {
-                let endpoint = spec.endpoint().expect("KD/KDNET always have an endpoint");
+                let endpoint = spec
+                    .endpoint()
+                    .expect("KD/KDNET/KDUSB always have an endpoint after validation");
                 Self::connect_kd(
                     endpoint,
                     *memory_source,
@@ -85,6 +87,18 @@ impl Session {
                         Backend::KdNet => {
                             let key = kdnet_key.as_deref().expect("validated above");
                             KdBackend::connect_net(endpoint, key, progress)
+                        }
+                        Backend::KdUsb => {
+                            #[cfg(target_os = "linux")]
+                            {
+                                KdBackend::connect_usb(endpoint, progress)
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                Err(Error::InvalidArgument(
+                                    "kdusb backend is only supported on Linux hosts".to_string(),
+                                ))
+                            }
                         }
                         Backend::Gdb | Backend::Memory => unreachable!("matched KD above"),
                     },
@@ -99,7 +113,9 @@ impl Session {
                             endpoint.expect("gdb always has an endpoint"),
                         )?),
                         Backend::Memory => Box::new(MemoryBackend::new()),
-                        Backend::Kd | Backend::KdNet => unreachable!("matched above"),
+                        Backend::Kd | Backend::KdNet | Backend::KdUsb => {
+                            unreachable!("matched above")
+                        },
                     })
                 })
             }
