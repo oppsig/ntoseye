@@ -41,7 +41,7 @@ mod linux {
     const TARGET_NAME_MAX: usize = 24;
     const USB_READ_REQUEST: usize = 0x0fb0;
     const TIMEOUT: Duration = Duration::from_secs(1);
-    const MAX_DISCOVERY_READS: usize = 8;
+    const MAX_DISCOVERY_READS: usize = 4;
 
     struct ProbeReport {
         vendor: u16,
@@ -54,6 +54,7 @@ mod linux {
         reply: Vec<u8>,
         usb_rx_len: usize,
         usb_rx_transfers: usize,
+        usb_rx_read_calls: usize,
         prelude: Vec<u8>,
         postlude: Vec<u8>,
         target_name: String,
@@ -86,6 +87,7 @@ mod linux {
         println!("USB_RX_REQUEST_LEN={USB_READ_REQUEST}");
         println!("USB_RX_TOTAL_LEN={}", report.usb_rx_len);
         println!("USB_RX_TRANSFER_COUNT={}", report.usb_rx_transfers);
+        println!("USB_RX_READ_CALL_COUNT={}", report.usb_rx_read_calls);
         println!("REPLY_RX_LEN={}", report.reply.len());
         println!("REPLY_RX_HEX={}", hex::encode(&report.reply));
         println!("PRELUDE_RX_LEN={}", report.prelude.len());
@@ -108,6 +110,7 @@ mod linux {
         println!("MAX_NAME_PROBE_TX=1");
         println!("MAX_DISCOVERY_READ_CALLS={MAX_DISCOVERY_READS}");
         println!("SINGLE_CANDIDATE_REQUIRED=true");
+        println!("AUTOMATIC_TIMEOUT_RETRY=false");
         println!("PRELUDE_RX_INTERPRETED=false");
         println!("POSTLUDE_RX_INTERPRETED=false");
         println!("BREAKIN_SENT=false");
@@ -321,9 +324,11 @@ mod linux {
 
             let mut stream = Vec::new();
             let mut transfers = 0usize;
+            let mut read_calls = 0usize;
 
-            for attempt in 0..MAX_DISCOVERY_READS {
+            for _ in 0..MAX_DISCOVERY_READS {
                 let mut response = vec![0u8; USB_READ_REQUEST];
+                read_calls += 1;
                 match handle.read_bulk(bulk_in, &mut response, TIMEOUT) {
                     Ok(0) => continue,
                     Ok(received) => {
@@ -351,16 +356,22 @@ mod linux {
                                 reply,
                                 usb_rx_len: stream.len(),
                                 usb_rx_transfers: transfers,
+                                usb_rx_read_calls: read_calls,
                                 prelude,
                                 postlude,
                                 target_name,
                             }));
                         }
                     }
-                    Err(rusb::Error::Timeout) if attempt + 1 < MAX_DISCOVERY_READS => continue,
+                    Err(rusb::Error::Timeout) => {
+                        return Err(format!(
+                            "reading KDUSB NAME= reply timed out on bounded read call {read_calls} after {transfers} non-empty transfer(s), {} accumulated byte(s); timeout is not retried",
+                            stream.len()
+                        ));
+                    }
                     Err(err) => {
                         return Err(format!(
-                            "reading KDUSB NAME= reply after {transfers} transfer(s), {} accumulated byte(s): {err}",
+                            "reading KDUSB NAME= reply failed on bounded read call {read_calls} after {transfers} non-empty transfer(s), {} accumulated byte(s): {err}",
                             stream.len()
                         ));
                     }
@@ -369,7 +380,7 @@ mod linux {
 
             let raw_prefix_len = stream.len().min(64);
             Err(format!(
-                "KDUSB NAME response not found after {transfers} transfer(s), {} accumulated byte(s); RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={}",
+                "KDUSB NAME response not found after {read_calls} bounded read call(s), {transfers} non-empty transfer(s), {} accumulated byte(s); RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={}",
                 stream.len(),
                 hex::encode(&stream[..raw_prefix_len])
             ))
@@ -423,6 +434,11 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn discovery_read_bound_is_four_calls() {
+            assert_eq!(MAX_DISCOVERY_READS, 4);
+        }
 
         #[test]
         fn single_candidate_guard_rejects_ambiguity_before_probe() {
