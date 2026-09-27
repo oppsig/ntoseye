@@ -373,6 +373,62 @@ impl<T: Read + Write> KdFraming<T> {
         }
     }
 
+    /// Send exactly one KD data packet and require the very next complete
+    /// protocol packet to be its matching ACK.
+    ///
+    /// This is stricter than `send_data_once`: unexpected inbound data is
+    /// returned as an error without being ACKed or queued. That preserves a
+    /// target-side stop for an explicit recovery path instead of silently
+    /// consuming a second state-change while a continue ACK is pending.
+    pub fn send_data_once_ack_only(&mut self, packet_type: u16, payload: &[u8]) -> Result<()> {
+        if payload.len() > PACKET_MAX_SIZE {
+            return Err(Error::Kd(format!(
+                "outbound packet too large: {} bytes",
+                payload.len()
+            )));
+        }
+
+        write_data_packet(
+            &mut self.transport,
+            packet_type,
+            self.current_packet_id,
+            payload,
+        )?;
+        self.transport.flush()?;
+
+        match self.recv_any_no_repair()? {
+            Received::Ack { packet_id } if self.ack_matches(packet_id) => {
+                if self.kdnet_packet_ids {
+                    self.current_packet_id =
+                        self.current_packet_id.wrapping_add(2) | KDNET_INITIAL_PACKET_ID;
+                } else {
+                    self.current_packet_id ^= 1;
+                    self.current_packet_id &= !SYNC_PACKET_ID;
+                }
+                Ok(())
+            }
+            Received::Ack { packet_id } => Err(Error::Kd(format!(
+                "one-shot ACK-only send received stray ACK id={packet_id:#x}, expected {:#x}",
+                self.current_packet_id
+            ))),
+            Received::Resend => Err(Error::Kd(
+                "one-shot ACK-only send received RESEND; retransmission disabled".to_string(),
+            )),
+            Received::Reset => Err(Error::Kd(
+                "one-shot ACK-only send received RESET; automatic resynchronization disabled"
+                    .to_string(),
+            )),
+            Received::Data {
+                packet_id,
+                packet_type,
+                payload,
+            } => Err(Error::Kd(format!(
+                "one-shot ACK-only send expected ACK but received unacknowledged data type={packet_type} id={packet_id:#x} len={}",
+                payload.len()
+            ))),
+        }
+    }
+
     /// Receive exactly one KD data packet and ACK it.
     ///
     /// This strict path never emits RESEND for malformed framing and never
@@ -1313,6 +1369,24 @@ mod tests {
 
         let outbound = &framing.transport.outbound;
         assert_eq!(outbound.len(), HEADER_SIZE + b"release".len() + 1);
+    }
+
+    #[test]
+    fn one_shot_ack_only_send_rejects_unexpected_data_without_ack() {
+        let inbound = data_packet(
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            INITIAL_PACKET_ID | SYNC_PACKET_ID,
+            b"second-stop",
+        );
+        let mut framing = KdFraming::new(Loopback::new(inbound));
+        let err = framing
+            .send_data_once_ack_only(PACKET_TYPE_KD_STATE_MANIPULATE, b"continue")
+            .unwrap_err();
+        assert!(err.to_string().contains("unacknowledged data"));
+
+        let outbound = &framing.transport.outbound;
+        assert_eq!(outbound.len(), HEADER_SIZE + b"continue".len() + 1);
+        assert_eq!(&outbound[..4], &DATA_PACKET_LEADER.to_le_bytes());
     }
 
     #[test]
