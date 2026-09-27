@@ -680,7 +680,7 @@ pub fn continue_api2_once<T: Read + Write>(
     write_u32(&mut header, UNION_OFFSET, continue_status);
     write_u32(&mut header, UNION_OFFSET + 4, if trace { 1 } else { 0 });
     write_u64(&mut header, UNION_OFFSET + 8, dr7);
-    framing.send_data_once(PACKET_TYPE_KD_STATE_MANIPULATE, &header)
+    framing.send_data_once_ack_only(PACKET_TYPE_KD_STATE_MANIPULATE, &header)
 }
 
 pub fn continue_api2<T: Read + Write>(
