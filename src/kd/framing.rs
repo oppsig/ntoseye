@@ -1287,4 +1287,47 @@ mod tests {
         let out = &framing.transport.outbound;
         assert_eq!(out.len(), (HEADER_SIZE + 1 + 1) + HEADER_SIZE);
     }
+
+    #[test]
+    fn one_shot_send_does_not_retransmit_on_resend() {
+        let resend = control_packet(PACKET_TYPE_KD_RESEND, 0);
+        let mut framing = KdFraming::new(Loopback::new(resend));
+        let err = framing
+            .send_data_once(PACKET_TYPE_KD_STATE_MANIPULATE, b"release")
+            .unwrap_err();
+        assert!(err.to_string().contains("RESEND"));
+
+        let outbound = &framing.transport.outbound;
+        assert_eq!(outbound.len(), HEADER_SIZE + b"release".len() + 1);
+        assert_eq!(&outbound[..4], &DATA_PACKET_LEADER.to_le_bytes());
+    }
+
+    #[test]
+    fn one_shot_send_does_not_retransmit_on_stray_ack() {
+        let stray = control_packet(PACKET_TYPE_KD_ACKNOWLEDGE, 0x1234_5678);
+        let mut framing = KdFraming::new(Loopback::new(stray));
+        let err = framing
+            .send_data_once(PACKET_TYPE_KD_STATE_MANIPULATE, b"release")
+            .unwrap_err();
+        assert!(err.to_string().contains("stray ACK"));
+
+        let outbound = &framing.transport.outbound;
+        assert_eq!(outbound.len(), HEADER_SIZE + b"release".len() + 1);
+    }
+
+    #[test]
+    fn one_shot_receive_bad_checksum_emits_no_resend() {
+        let mut packet = data_packet(
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            INITIAL_PACKET_ID | SYNC_PACKET_ID,
+            b"state",
+        );
+        packet[12] ^= 0x01;
+
+        let mut framing = KdFraming::new(Loopback::new(packet));
+        let err = framing.recv_data_once().unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"));
+        assert!(framing.transport.outbound.is_empty());
+    }
+
 }
