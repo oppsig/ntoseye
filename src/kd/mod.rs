@@ -64,6 +64,8 @@ mod kdnet;
 #[allow(dead_code)]
 mod kdusb;
 mod memory;
+mod minimal_attach;
+pub use minimal_attach::*;
 mod pump;
 mod registers;
 mod run;
