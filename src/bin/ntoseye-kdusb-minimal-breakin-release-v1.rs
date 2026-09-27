@@ -51,10 +51,7 @@ fn main() {
             println!("NUMBER_PROCESSORS={}", report.number_processors);
             println!("PROGRAM_COUNTER=0x{:016x}", report.program_counter);
             println!("DR7=0x{:016x}", report.dr7);
-            println!(
-                "DR7_FROM_CONTROL_REPORT={}",
-                report.dr7_from_control_report
-            );
+            println!("DR7_FROM_CONTROL_REPORT={}", report.dr7_from_control_report);
             println!("CONTINUE_ACKED={}", report.continue_acked);
             println!("TARGET_MAY_BE_HALTED=false");
         }
