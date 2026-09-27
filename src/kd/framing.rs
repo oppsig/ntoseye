@@ -300,6 +300,119 @@ impl<T: Read + Write> KdFraming<T> {
         Ok(())
     }
 
+
+    /// Send exactly one KD data packet and wait for one matching transport ACK.
+    ///
+    /// Unlike `send_data`, this never retransmits on timeout, RESEND, RESET,
+    /// or a stray ACK. Fresh inbound data observed while the ACK is pending is
+    /// ACKed and queued once, preserving KD ordering without retrying the
+    /// outbound request.
+    pub fn send_data_once(&mut self, packet_type: u16, payload: &[u8]) -> Result<()> {
+        if payload.len() > PACKET_MAX_SIZE {
+            return Err(Error::Kd(format!(
+                "outbound packet too large: {} bytes",
+                payload.len()
+            )));
+        }
+
+        write_data_packet(
+            &mut self.transport,
+            packet_type,
+            self.current_packet_id,
+            payload,
+        )?;
+        self.transport.flush()?;
+
+        loop {
+            match self.recv_any_no_repair()? {
+                Received::Ack { packet_id } if self.ack_matches(packet_id) => {
+                    if self.kdnet_packet_ids {
+                        self.current_packet_id =
+                            self.current_packet_id.wrapping_add(2) | KDNET_INITIAL_PACKET_ID;
+                    } else {
+                        self.current_packet_id ^= 1;
+                        self.current_packet_id &= !SYNC_PACKET_ID;
+                    }
+                    return Ok(());
+                }
+                Received::Data {
+                    packet_id,
+                    packet_type,
+                    payload,
+                } => {
+                    let ack_id = self.remote_ack_id(packet_id);
+                    self.send_control(PACKET_TYPE_KD_ACKNOWLEDGE, ack_id)?;
+                    if !self.accept_remote_packet(packet_id) {
+                        return Err(Error::Kd(format!(
+                            "one-shot send observed stale queued data id={packet_id:#x}"
+                        )));
+                    }
+                    self.queued_data.push_back(DataPacket {
+                        packet_type,
+                        payload,
+                    });
+                }
+                Received::Ack { packet_id } => {
+                    return Err(Error::Kd(format!(
+                        "one-shot send received stray ACK id={packet_id:#x}, expected {:#x}",
+                        self.current_packet_id
+                    )));
+                }
+                Received::Resend => {
+                    return Err(Error::Kd(
+                        "one-shot send received RESEND; retransmission disabled".to_string(),
+                    ));
+                }
+                Received::Reset => {
+                    return Err(Error::Kd(
+                        "one-shot send received RESET; automatic resynchronization disabled"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Receive exactly one KD data packet and ACK it.
+    ///
+    /// This strict path never emits RESEND for malformed framing and never
+    /// echoes RESET. Any control packet or stale data is an error so a bounded
+    /// experiment cannot silently broaden its protocol footprint.
+    pub fn recv_data_once(&mut self) -> Result<DataPacket> {
+        if let Some(pkt) = self.queued_data.pop_front() {
+            return Ok(pkt);
+        }
+
+        match self.recv_any_no_repair()? {
+            Received::Data {
+                packet_type,
+                packet_id,
+                payload,
+            } => {
+                let ack_id = self.remote_ack_id(packet_id);
+                self.send_control(PACKET_TYPE_KD_ACKNOWLEDGE, ack_id)?;
+                if !self.accept_remote_packet(packet_id) {
+                    return Err(Error::Kd(format!(
+                        "one-shot receive observed stale data id={packet_id:#x}"
+                    )));
+                }
+                Ok(DataPacket {
+                    packet_type,
+                    payload,
+                })
+            }
+            Received::Ack { packet_id } => Err(Error::Kd(format!(
+                "one-shot receive expected data but got ACK id={packet_id:#x}"
+            ))),
+            Received::Resend => Err(Error::Kd(
+                "one-shot receive got RESEND; automatic retransmission disabled".to_string(),
+            )),
+            Received::Reset => Err(Error::Kd(
+                "one-shot receive got RESET; automatic resynchronization disabled".to_string(),
+            )),
+        }
+    }
+
     pub fn send_data(&mut self, packet_type: u16, payload: &[u8]) -> Result<()> {
         if payload.len() > PACKET_MAX_SIZE {
             return Err(Error::Kd(format!(
@@ -517,6 +630,67 @@ impl<T: Read + Write> KdFraming<T> {
             .write_all(&Header::control(packet_type, packet_id).encode())?;
         self.transport.flush()?;
         Ok(())
+    }
+
+
+    fn recv_any_no_repair(&mut self) -> Result<Received> {
+        let leader = self.read_packet_leader()?;
+        self.sync_kdnet_session();
+
+        let mut tail = [0u8; HEADER_SIZE - 4];
+        self.transport.read_exact(&mut tail)?;
+
+        let mut header_buf = [0u8; HEADER_SIZE];
+        header_buf[0..4].copy_from_slice(&leader.to_le_bytes());
+        header_buf[4..].copy_from_slice(&tail);
+        let header = Header::decode(&header_buf);
+
+        if !header.is_data() {
+            return Ok(match header.packet_type {
+                PACKET_TYPE_KD_ACKNOWLEDGE => Received::Ack {
+                    packet_id: header.packet_id,
+                },
+                PACKET_TYPE_KD_RESEND => Received::Resend,
+                PACKET_TYPE_KD_RESET => Received::Reset,
+                other => {
+                    return Err(Error::Kd(format!(
+                        "unknown control packet type {other:#x}"
+                    )));
+                }
+            });
+        }
+
+        let len = header.byte_count as usize;
+        if len > PACKET_MAX_SIZE {
+            return Err(Error::Kd(format!(
+                "inbound packet too large: {len} bytes"
+            )));
+        }
+
+        let mut payload = vec![0u8; len];
+        self.transport.read_exact(&mut payload)?;
+        let mut trailer = [0u8; 1];
+        self.transport.read_exact(&mut trailer)?;
+        if trailer[0] != PACKET_TRAILING_BYTE {
+            return Err(Error::Kd(format!(
+                "one-shot receive invalid trailer {:#04x}; RESEND disabled",
+                trailer[0]
+            )));
+        }
+
+        let computed = checksum(&payload);
+        if computed != header.checksum {
+            return Err(Error::Kd(format!(
+                "one-shot receive checksum mismatch: expected {:#010x}, computed {computed:#010x}; RESEND disabled",
+                header.checksum
+            )));
+        }
+
+        Ok(Received::Data {
+            packet_type: header.packet_type,
+            packet_id: header.packet_id,
+            payload,
+        })
     }
 
     fn recv_any(&mut self) -> Result<Received> {
