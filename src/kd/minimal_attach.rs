@@ -293,6 +293,7 @@ mod tests {
         framing.send_breakin().unwrap();
         let err = framing.recv_data_once().unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"));
+        drop(framing);
         assert_eq!(transport.outbound, vec![crate::kd::framing::BREAKIN_BYTE]);
     }
 }
