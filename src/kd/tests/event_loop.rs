@@ -935,3 +935,135 @@ fn pump_exits_on_shutdown_when_idle() {
     let _framing = handle.join().expect("pump thread panicked");
     assert!(rx.try_recv().is_err(), "idle pump should report no stop");
 }
+
+
+#[test]
+fn minimal_initial_break_get_version_continue_round_trip() {
+    let (mut kernel, host) = UnixStream::pair().unwrap();
+    kernel
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let host_worker = spawn(move || {
+        let mut framing = KdFraming::new(host.into());
+
+        // Minimal attach stimulus: one unframed KD break-in byte.
+        framing.send_breakin().unwrap();
+
+        // Receive and ACK exactly one initial state-change.
+        let stop = await_state_change(
+            &mut framing,
+            AwaitStateOptions {
+                arch: Arch::Amd64,
+                saw_kd_refresh: None,
+                filter: StateChangeFilter::Handshake,
+                bugcheck: None,
+                bugcheck_capture: None,
+                deadline: None,
+                debug_log: None,
+            },
+        )
+        .unwrap();
+
+        // Learn the target architecture/version before constructing the
+        // architecture-specific continue request.
+        let version = api::get_version(&mut framing, stop.processor).unwrap();
+        assert_eq!(version.machine_type, 0x8664);
+
+        // Minimal clean release for this AMD64 fixture: continue execution.
+        api::continue_api2(
+            &mut framing,
+            stop.processor,
+            api::DBG_CONTINUE,
+            false,
+            0,
+        )
+        .unwrap();
+
+        stop
+    });
+
+    let mut breakin = [0u8; 1];
+    kernel.read_exact(&mut breakin).unwrap();
+    assert_eq!(breakin[0], BREAKIN_BYTE);
+
+    let pc = 0xffff_f800_1234_5678u64;
+    kernel
+        .write_all(&data_packet(
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            INITIAL_PACKET_ID,
+            &exception_state_change_payload(pc),
+        ))
+        .unwrap();
+    kernel.flush().unwrap();
+
+    // recv_data()/await_state_change must ACK the state-change before the
+    // host proceeds to any manipulate-state request.
+    let state_ack = read_wire_packet(&mut kernel);
+    let state_ack_header = wire_header(&state_ack);
+    assert_eq!(state_ack_header.packet_type, PACKET_TYPE_KD_ACKNOWLEDGE);
+    assert_eq!(state_ack_header.packet_id, INITIAL_PACKET_ID);
+
+    let version_request = read_wire_packet(&mut kernel);
+    let version_header = wire_header(&version_request);
+    let version_payload = &version_request[HEADER_SIZE..];
+    assert_eq!(
+        u32::from_le_bytes(version_payload[0..4].try_into().unwrap()),
+        api::DBGKD_GET_VERSION
+    );
+
+    kernel
+        .write_all(&control_packet(
+            PACKET_TYPE_KD_ACKNOWLEDGE,
+            version_header.packet_id,
+        ))
+        .unwrap();
+
+    let mut version_union = [0u8; 40];
+    version_union[8..10].copy_from_slice(&0x8664u16.to_le_bytes());
+    let version_reply =
+        manipulate_reply_payload(api::DBGKD_GET_VERSION, 0, &version_union);
+    kernel
+        .write_all(&data_packet(
+            PACKET_TYPE_KD_STATE_MANIPULATE,
+            INITIAL_PACKET_ID ^ 1,
+            &version_reply,
+        ))
+        .unwrap();
+    kernel.flush().unwrap();
+
+    let version_reply_ack = read_wire_packet(&mut kernel);
+    let version_reply_ack_header = wire_header(&version_reply_ack);
+    assert_eq!(
+        version_reply_ack_header.packet_type,
+        PACKET_TYPE_KD_ACKNOWLEDGE
+    );
+    assert_eq!(
+        version_reply_ack_header.packet_id,
+        INITIAL_PACKET_ID ^ 1
+    );
+
+    let continue_request = read_wire_packet(&mut kernel);
+    let continue_header = wire_header(&continue_request);
+    let continue_payload = &continue_request[HEADER_SIZE..];
+    assert_eq!(
+        u32::from_le_bytes(continue_payload[0..4].try_into().unwrap()),
+        api::DBGKD_CONTINUE_API2
+    );
+    assert_eq!(
+        u32::from_le_bytes(continue_payload[16..20].try_into().unwrap()),
+        api::DBG_CONTINUE
+    );
+
+    kernel
+        .write_all(&control_packet(
+            PACKET_TYPE_KD_ACKNOWLEDGE,
+            continue_header.packet_id,
+        ))
+        .unwrap();
+    kernel.flush().unwrap();
+
+    let stop = host_worker.join().unwrap();
+    assert_eq!(stop.processor, 0);
+    assert_eq!(stop.program_counter, pc);
+}
