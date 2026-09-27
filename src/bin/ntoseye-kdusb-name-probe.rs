@@ -102,6 +102,12 @@ mod linux {
         println!("INTERFACE_RELEASED=true");
         println!("USB_CONTROL_TRANSFER=false");
         println!("KD_PACKET_TX=false");
+        println!("KD_ACK_TX=false");
+        println!("KD_RESEND_TX=false");
+        println!("KD_RESET_TX=false");
+        println!("MAX_NAME_PROBE_TX=1");
+        println!("MAX_DISCOVERY_READ_CALLS={MAX_DISCOVERY_READS}");
+        println!("SINGLE_CANDIDATE_REQUIRED=true");
         println!("PRELUDE_RX_INTERPRETED=false");
         println!("POSTLUDE_RX_INTERPRETED=false");
         println!("BREAKIN_SENT=false");
