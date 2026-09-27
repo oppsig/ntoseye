@@ -41,6 +41,7 @@ mod linux {
     const TARGET_NAME_MAX: usize = 24;
     const USB_READ_REQUEST: usize = 0x0fb0;
     const TIMEOUT: Duration = Duration::from_secs(1);
+    const MAX_DISCOVERY_READS: usize = 8;
 
     struct ProbeReport {
         vendor: u16,
@@ -52,7 +53,9 @@ mod linux {
         max_packet: u16,
         reply: Vec<u8>,
         usb_rx_len: usize,
-        trailing_rx_len: usize,
+        usb_rx_transfers: usize,
+        prelude: Vec<u8>,
+        postlude: Vec<u8>,
         target_name: String,
     }
 
@@ -81,15 +84,26 @@ mod linux {
         println!("PROBE_TX_LEN={}", NAME_PROBE.len());
         println!("PROBE_TX_HEX={}", hex::encode(NAME_PROBE));
         println!("USB_RX_REQUEST_LEN={USB_READ_REQUEST}");
-        println!("USB_RX_TRANSFER_LEN={}", report.usb_rx_len);
+        println!("USB_RX_TOTAL_LEN={}", report.usb_rx_len);
+        println!("USB_RX_TRANSFER_COUNT={}", report.usb_rx_transfers);
         println!("REPLY_RX_LEN={}", report.reply.len());
         println!("REPLY_RX_HEX={}", hex::encode(&report.reply));
-        println!("TRAILING_RX_LEN={}", report.trailing_rx_len);
+        println!("PRELUDE_RX_LEN={}", report.prelude.len());
+        println!(
+            "PRELUDE_RX_PREFIX_HEX={}",
+            hex::encode(&report.prelude[..report.prelude.len().min(64)])
+        );
+        println!("POSTLUDE_RX_LEN={}", report.postlude.len());
+        println!(
+            "POSTLUDE_RX_PREFIX_HEX={}",
+            hex::encode(&report.postlude[..report.postlude.len().min(64)])
+        );
         println!("REPLY_TARGET={}", report.target_name);
         println!("INTERFACE_RELEASED=true");
         println!("USB_CONTROL_TRANSFER=false");
         println!("KD_PACKET_TX=false");
-        println!("TRAILING_RX_INTERPRETED=false");
+        println!("PRELUDE_RX_INTERPRETED=false");
+        println!("POSTLUDE_RX_INTERPRETED=false");
         println!("BREAKIN_SENT=false");
         println!("DEBUGGER_SESSION=false");
         println!("TARGET_MEMORY_ACCESS=false");
@@ -250,65 +264,78 @@ mod linux {
                 ));
             }
 
-            // USB2DBG posts a 4016-byte USB receive and presents the result as
-            // a byte stream to its caller. A raw libusb buffer sized only to
-            // the <=37-byte logical NAME reply can overflow when the device
-            // completes a larger USB transfer. Match the recovered Windows
-            // receive quantum, then validate only the logical NAME response.
-            let mut response = vec![0u8; USB_READ_REQUEST];
-            let received = handle
-                .read_bulk(bulk_in, &mut response, TIMEOUT)
-                .map_err(|err| format!("reading KDUSB NAME= reply: {err}"))?;
-
+            // USB2DBG posts 4016-byte receives. A live target can already
+            // have KD packets queued when NAME? is sent, so NAME= is not
+            // guaranteed to begin the first bulk-IN completion. Accumulate a
+            // bounded number of transfers, find the exact target identity,
+            // and report (but do not interpret or answer) the surrounding KD
+            // byte stream.
             let logical_len = NAME_PREFIX.len() + expected.len() + 2;
             if logical_len > NAME_RESPONSE_MAX {
                 return Err(format!(
                     "expected NAME reply length {logical_len} exceeds logical maximum {NAME_RESPONSE_MAX}"
                 ));
             }
-            if received < logical_len {
-                return Err(format!(
-                    "short KDUSB NAME= reply: received {received} bytes, need at least {logical_len}"
-                ));
+
+            let mut needle = Vec::with_capacity(logical_len);
+            needle.extend_from_slice(NAME_PREFIX);
+            needle.extend_from_slice(expected.as_bytes());
+            needle.extend_from_slice(&[0, 0]);
+
+            let mut stream = Vec::new();
+            let mut transfers = 0usize;
+
+            for attempt in 0..MAX_DISCOVERY_READS {
+                let mut response = vec![0u8; USB_READ_REQUEST];
+                match handle.read_bulk(bulk_in, &mut response, TIMEOUT) {
+                    Ok(0) => continue,
+                    Ok(received) => {
+                        transfers += 1;
+                        stream.extend_from_slice(&response[..received]);
+
+                        if let Some(start) = stream
+                            .windows(needle.len())
+                            .position(|window| window == needle.as_slice())
+                        {
+                            let end = start + needle.len();
+                            let reply = stream[start..end].to_vec();
+                            let target_name = parse_name_response(&reply)?.to_string();
+                            let prelude = stream[..start].to_vec();
+                            let postlude = stream[end..].to_vec();
+
+                            return Ok(Some(ProbeReport {
+                                vendor,
+                                product,
+                                interface,
+                                alternate_setting,
+                                bulk_in,
+                                bulk_out,
+                                max_packet,
+                                reply,
+                                usb_rx_len: stream.len(),
+                                usb_rx_transfers: transfers,
+                                prelude,
+                                postlude,
+                                target_name,
+                            }));
+                        }
+                    }
+                    Err(rusb::Error::Timeout) if attempt + 1 < MAX_DISCOVERY_READS => continue,
+                    Err(err) => {
+                        return Err(format!(
+                            "reading KDUSB NAME= reply after {transfers} transfer(s), {} accumulated byte(s): {err}",
+                            stream.len()
+                        ));
+                    }
+                }
             }
 
-            let raw_prefix_len = received.min(64);
-            let raw_prefix_hex = hex::encode(&response[..raw_prefix_len]);
-
-            if !response[..received].starts_with(NAME_PREFIX) {
-                return Err(format!(
-                    "KDUSB NAME response is missing NAME= prefix; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
-                ));
-            }
-
-            let reply = response[..logical_len].to_vec();
-            let target_name = parse_name_response(&reply)
-                .map_err(|err| {
-                    format!(
-                        "{err}; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
-                    )
-                })?
-                .to_string();
-
-            if target_name != expected || reply[logical_len - 2..] != [0, 0] {
-                return Err(format!(
-                    "KDUSB NAME reply did not match expected target '{expected}'; USB_RX_TRANSFER_LEN={received}; RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={raw_prefix_hex}"
-                ));
-            }
-
-            Ok(Some(ProbeReport {
-                vendor,
-                product,
-                interface,
-                alternate_setting,
-                bulk_in,
-                bulk_out,
-                max_packet,
-                reply,
-                usb_rx_len: received,
-                trailing_rx_len: received - logical_len,
-                target_name,
-            }))
+            let raw_prefix_len = stream.len().min(64);
+            Err(format!(
+                "KDUSB NAME response not found after {transfers} transfer(s), {} accumulated byte(s); RAW_RX_PREFIX_LEN={raw_prefix_len}; RAW_RX_PREFIX_HEX={}",
+                stream.len(),
+                hex::encode(&stream[..raw_prefix_len])
+            ))
         })();
 
         let release_result = handle
@@ -364,6 +391,19 @@ mod linux {
         fn exact_clsa0102_reply_parses() {
             let reply = b"NAME=CLSA0102_USB\0\0";
             assert_eq!(parse_name_response(reply).unwrap(), "CLSA0102_USB");
+        }
+
+        #[test]
+        fn expected_name_can_be_found_after_queued_kd_bytes() {
+            let mut stream = vec![0x30, 0x30, 0x30, 0x30, 0x0b, 0x00];
+            stream.extend_from_slice(b"NAME=CLSA0102_USB\0\0");
+            let needle = b"NAME=CLSA0102_USB\0\0";
+            assert_eq!(
+                stream
+                    .windows(needle.len())
+                    .position(|window| window == needle),
+                Some(6)
+            );
         }
 
         #[test]
