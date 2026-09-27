@@ -117,14 +117,8 @@ pub fn minimal_breakin_release_with_transport<T: Read + Write>(
     let dr7_from_control_report = dr7.is_some();
     let dr7 = dr7.unwrap_or(0);
 
-    api::continue_api2_once(
-        &mut framing,
-        stop.processor,
-        api::DBG_CONTINUE,
-        false,
-        dr7,
-    )
-    .map_err(|err| failure(MinimalBreakinReleaseStage::Continue, true, err))?;
+    api::continue_api2_once(&mut framing, stop.processor, api::DBG_CONTINUE, false, dr7)
+        .map_err(|err| failure(MinimalBreakinReleaseStage::Continue, true, err))?;
 
     Ok(MinimalBreakinReleaseReport {
         processor: stop.processor,
@@ -155,9 +149,8 @@ mod tests {
     use std::io::{Cursor, Read, Write};
 
     use crate::kd::framing::{
-        HEADER_SIZE, Header, INITIAL_PACKET_ID, PACKET_TYPE_KD_ACKNOWLEDGE,
-        PACKET_TYPE_KD_RESEND, PACKET_TYPE_KD_STATE_MANIPULATE, SYNC_PACKET_ID,
-        control_packet, data_packet,
+        HEADER_SIZE, Header, INITIAL_PACKET_ID, PACKET_TYPE_KD_ACKNOWLEDGE, PACKET_TYPE_KD_RESEND,
+        PACKET_TYPE_KD_STATE_MANIPULATE, SYNC_PACKET_ID, control_packet, data_packet,
     };
 
     struct Loopback {
@@ -254,8 +247,8 @@ mod tests {
         assert_eq!(continue_header.packet_type, PACKET_TYPE_KD_STATE_MANIPULATE);
         assert_eq!(continue_header.packet_id, INITIAL_PACKET_ID);
 
-        let report = minimal_breakin_release_with_transport(Loopback::new(happy_inbound(pc, dr7)))
-            .unwrap();
+        let report =
+            minimal_breakin_release_with_transport(Loopback::new(happy_inbound(pc, dr7))).unwrap();
         assert_eq!(report.program_counter, pc);
         assert_eq!(report.dr7, dr7);
         assert!(report.dr7_from_control_report);
