@@ -28,6 +28,25 @@ pub(crate) const TARGET_NAME_MAX: usize = 24;
 pub(crate) const USB_READ_REQUEST: usize = 0x0fb0;
 pub(crate) const USB3_WRITE_CHUNK: usize = 0x1000;
 
+/// Locate the exact target-side NAME response inside a discovery byte stream.
+///
+/// A live target may already have KD packets queued when the host sends NAME?.
+/// Those bytes belong to KD framing and must not be discarded merely because
+/// they arrived before the transport-level identity response.
+fn split_expected_name_response(bytes: &[u8], expected: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut needle = Vec::with_capacity(NAME_RESPONSE_PREFIX.len() + expected.len() + 2);
+    needle.extend_from_slice(NAME_RESPONSE_PREFIX);
+    needle.extend_from_slice(expected.as_bytes());
+    needle.extend_from_slice(&[0, 0]);
+
+    let start = bytes
+        .windows(needle.len())
+        .position(|window| window == needle.as_slice())?;
+    let end = start + needle.len();
+
+    Some((bytes[..start].to_vec(), bytes[end..].to_vec()))
+}
+
 /// Parse the USB2DBG bootstrap reply and return its target name.
 ///
 /// The Windows host accepts 5..=37 bytes, requires NAME=, and passes the
@@ -189,6 +208,12 @@ impl<I: BulkIo> KdUsbStreamCore<I> {
         })
     }
 
+    fn with_initial_rx(io: I, endpoints: BulkEndpoints, initial_rx: Vec<u8>) -> io::Result<Self> {
+        let mut stream = Self::new(io, endpoints)?;
+        stream.rx.extend(initial_rx);
+        Ok(stream)
+    }
+
     pub(crate) fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
             io: self.io.clone(),
@@ -305,6 +330,7 @@ mod linux {
     use std::time::Duration;
 
     const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(1);
+    const DISCOVERY_MAX_READS: usize = 8;
 
     pub struct KdUsbStream {
         inner: KdUsbStreamCore<RusbBulkIo>,
@@ -331,9 +357,9 @@ mod linux {
     impl KdUsbStream {
         pub(crate) fn connect(target_name: &str) -> io::Result<Self> {
             validate_requested_target_name(target_name)?;
-            let (io, endpoints) = open_named_device(target_name)?;
+            let (io, endpoints, initial_rx) = open_named_device(target_name)?;
             Ok(Self {
-                inner: KdUsbStreamCore::new(io, endpoints)?,
+                inner: KdUsbStreamCore::with_initial_rx(io, endpoints, initial_rx)?,
             })
         }
 
@@ -385,7 +411,9 @@ mod linux {
         KDUSB_HARDWARE_IDS.contains(&(vendor, product))
     }
 
-    fn open_named_device(target_name: &str) -> io::Result<(RusbBulkIo, BulkEndpoints)> {
+    fn open_named_device(
+        target_name: &str,
+    ) -> io::Result<(RusbBulkIo, BulkEndpoints, Vec<u8>)> {
         let devices = rusb::devices().map_err(|err| usb_error("enumerating USB devices", err))?;
         let mut saw_interface = false;
         let mut last_error = None;
@@ -459,7 +487,7 @@ mod linux {
                         endpoints,
                         target_name,
                     ) {
-                        Ok(Some(io)) => return Ok((io, endpoints)),
+                        Ok(Some((io, initial_rx))) => return Ok((io, endpoints, initial_rx)),
                         Ok(None) => {}
                         Err(err) => last_error = Some(err),
                     }
@@ -535,16 +563,44 @@ mod linux {
             ));
         }
 
-        let mut response = [0u8; NAME_RESPONSE_MAX];
-        let received = handle
-            .read_bulk(endpoints.input, &mut response, DISCOVERY_TIMEOUT)
-            .map_err(|err| usb_error("reading KDUSB NAME= reply", err))?;
+        // NAME? is transport-level discovery, but a running kernel may already
+        // have KD packets queued on bulk IN. Read using the recovered Windows
+        // 4016-byte receive quantum until the exact NAME response appears.
+        // Preserve every byte before/after NAME= for KdFraming.
+        let mut discovery = Vec::new();
+        for attempt in 0..DISCOVERY_MAX_READS {
+            let mut transfer = vec![0u8; USB_READ_REQUEST];
+            match handle.read_bulk(endpoints.input, &mut transfer, DISCOVERY_TIMEOUT) {
+                Ok(0) => continue,
+                Ok(received) => {
+                    if received > transfer.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "KDUSB discovery read returned more bytes than requested",
+                        ));
+                    }
+                    discovery.extend_from_slice(&transfer[..received]);
 
-        if !name_response_matches(&response[..received], target_name)? {
-            return Ok(None);
+                    if let Some((before, after)) =
+                        split_expected_name_response(&discovery, target_name)
+                    {
+                        let mut initial_rx = before;
+                        initial_rx.extend(after);
+                        return Ok(Some((RusbBulkIo { handle }, initial_rx)));
+                    }
+                }
+                Err(rusb::Error::Timeout) if attempt + 1 < DISCOVERY_MAX_READS => continue,
+                Err(err) => return Err(usb_error("reading KDUSB NAME= reply", err)),
+            }
         }
 
-        Ok(Some(RusbBulkIo { handle }))
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "KDUSB target did not return NAME={target_name} within {DISCOVERY_MAX_READS} reads; preserved {} queued byte(s)",
+                discovery.len()
+            ),
+        ))
     }
 
     fn usb_error(context: &str, err: rusb::Error) -> io::Error {
@@ -659,6 +715,40 @@ mod tests {
     }
 
     const CLSA0102_REPLY: &[u8] = b"NAME=CLSA0102_USB\0\0";
+
+    #[test]
+    fn discovery_extracts_name_after_queued_kd_bytes() {
+        let mut bytes = vec![0x30, 0x30, 0x30, 0x30, 0x0b, 0x00];
+        bytes.extend_from_slice(b"NAME=CLSA0102_USB\0\0");
+        bytes.extend_from_slice(&[0xaa, 0x69]);
+
+        let (before, after) = split_expected_name_response(&bytes, "CLSA0102_USB").unwrap();
+        assert_eq!(before, vec![0x30, 0x30, 0x30, 0x30, 0x0b, 0x00]);
+        assert_eq!(after, vec![0xaa, 0x69]);
+    }
+
+    #[test]
+    fn discovery_name_can_span_accumulated_usb_reads() {
+        let mut bytes = b"queued-kdNAME=CLSA".to_vec();
+        assert!(split_expected_name_response(&bytes, "CLSA0102_USB").is_none());
+        bytes.extend_from_slice(b"0102_USB\0\0tail");
+
+        let (before, after) = split_expected_name_response(&bytes, "CLSA0102_USB").unwrap();
+        assert_eq!(before, b"queued-kd");
+        assert_eq!(after, b"tail");
+    }
+
+    #[test]
+    fn stream_drains_seeded_discovery_bytes_before_usb() {
+        let io = MockBulkIo::default();
+        let mut stream =
+            KdUsbStreamCore::with_initial_rx(io, test_endpoints(), b"queued".to_vec()).unwrap();
+
+        let mut out = [0u8; 6];
+        assert_eq!(stream.read(&mut out).unwrap(), 6);
+        assert_eq!(&out, b"queued");
+        assert!(stream.io.read_requests.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn stream_buffers_surplus_bulk_read_bytes() {
