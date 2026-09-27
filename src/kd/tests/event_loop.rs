@@ -936,7 +936,6 @@ fn pump_exits_on_shutdown_when_idle() {
     assert!(rx.try_recv().is_err(), "idle pump should report no stop");
 }
 
-
 #[test]
 fn minimal_initial_break_get_version_continue_round_trip() {
     let (mut kernel, host) = UnixStream::pair().unwrap();
@@ -971,14 +970,7 @@ fn minimal_initial_break_get_version_continue_round_trip() {
         assert_eq!(version.machine_type, 0x8664);
 
         // Minimal clean release for this AMD64 fixture: continue execution.
-        api::continue_api2(
-            &mut framing,
-            stop.processor,
-            api::DBG_CONTINUE,
-            false,
-            0,
-        )
-        .unwrap();
+        api::continue_api2(&mut framing, stop.processor, api::DBG_CONTINUE, false, 0).unwrap();
 
         stop
     });
@@ -1021,8 +1013,7 @@ fn minimal_initial_break_get_version_continue_round_trip() {
 
     let mut version_union = [0u8; 40];
     version_union[8..10].copy_from_slice(&0x8664u16.to_le_bytes());
-    let version_reply =
-        manipulate_reply_payload(api::DBGKD_GET_VERSION, 0, &version_union);
+    let version_reply = manipulate_reply_payload(api::DBGKD_GET_VERSION, 0, &version_union);
     kernel
         .write_all(&data_packet(
             PACKET_TYPE_KD_STATE_MANIPULATE,
@@ -1038,10 +1029,7 @@ fn minimal_initial_break_get_version_continue_round_trip() {
         version_reply_ack_header.packet_type,
         PACKET_TYPE_KD_ACKNOWLEDGE
     );
-    assert_eq!(
-        version_reply_ack_header.packet_id,
-        INITIAL_PACKET_ID ^ 1
-    );
+    assert_eq!(version_reply_ack_header.packet_id, INITIAL_PACKET_ID ^ 1);
 
     let continue_request = read_wire_packet(&mut kernel);
     let continue_header = wire_header(&continue_request);
