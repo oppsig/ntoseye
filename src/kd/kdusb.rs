@@ -517,7 +517,7 @@ mod linux {
         alternate_setting: u8,
         endpoints: BulkEndpoints,
         target_name: &str,
-    ) -> io::Result<Option<RusbBulkIo>> {
+    ) -> io::Result<Option<(RusbBulkIo, Vec<u8>)>> {
         let handle = device
             .open()
             .map_err(|err| usb_error("opening classic KDUSB device", err))?;
