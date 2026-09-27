@@ -273,6 +273,27 @@ mod tests {
     }
 
     #[test]
+    fn second_state_change_before_continue_ack_marks_halt_risk() {
+        let pc = 0xffff_f800_1234_5678;
+        let dr7 = 0x400;
+        let mut inbound = data_packet(
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            INITIAL_PACKET_ID | SYNC_PACKET_ID,
+            &state_change_payload(pc, dr7),
+        );
+        inbound.extend(data_packet(
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            INITIAL_PACKET_ID ^ 1,
+            &state_change_payload(pc.wrapping_add(1), dr7),
+        ));
+
+        let err = minimal_breakin_release_with_transport(Loopback::new(inbound)).unwrap_err();
+        assert_eq!(err.stage, MinimalBreakinReleaseStage::Continue);
+        assert!(err.target_may_be_halted);
+        assert!(err.message.contains("unacknowledged data"));
+    }
+
+    #[test]
     fn bad_state_change_checksum_sends_no_resend_and_marks_halt_risk() {
         let mut packet = data_packet(
             PACKET_TYPE_KD_STATE_CHANGE64,
