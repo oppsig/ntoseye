@@ -123,9 +123,30 @@ mod linux {
         }
     }
 
+    #[derive(Clone, Copy)]
+    struct CandidateMeta {
+        vendor: u16,
+        product: u16,
+        interface: u8,
+        alternate_setting: u8,
+        bulk_in: u8,
+        bulk_out: u8,
+        max_packet: u16,
+    }
+
+    fn require_single_candidate<T>(mut candidates: Vec<T>) -> Result<T, String> {
+        match candidates.len() {
+            0 => Err("no supported classic KDUSB dc/02/ff interface found".to_string()),
+            1 => Ok(candidates.pop().expect("length checked")),
+            count => Err(format!(
+                "{count} supported classic KDUSB interfaces found; refusing ambiguous multi-candidate NAME? probing"
+            )),
+        }
+    }
+
     fn probe(expected: &str) -> Result<ProbeReport, String> {
         let devices = rusb::devices().map_err(|err| format!("enumerating USB devices: {err}"))?;
-        let mut saw_interface = false;
+        let mut candidates = Vec::new();
         let mut last_error = None;
 
         for device in devices.iter() {
@@ -178,34 +199,44 @@ mod linux {
                         continue;
                     };
 
-                    saw_interface = true;
-                    match probe_candidate(
-                        &device,
-                        descriptor.vendor_id(),
-                        descriptor.product_id(),
-                        descriptor_if.interface_number(),
-                        descriptor_if.setting_number(),
-                        bulk_in,
-                        bulk_out,
-                        max_packet,
-                        expected,
-                    ) {
-                        Ok(Some(report)) => return Ok(report),
-                        Ok(None) => {}
-                        Err(err) => last_error = Some(err),
-                    }
+                    candidates.push((
+                        device.clone(),
+                        CandidateMeta {
+                            vendor: descriptor.vendor_id(),
+                            product: descriptor.product_id(),
+                            interface: descriptor_if.interface_number(),
+                            alternate_setting: descriptor_if.setting_number(),
+                            bulk_in,
+                            bulk_out,
+                            max_packet,
+                        },
+                    ));
                 }
             }
         }
 
-        if let Some(err) = last_error {
-            Err(err)
-        } else if saw_interface {
-            Err(format!(
+        if candidates.is_empty() {
+            if let Some(err) = last_error {
+                return Err(err);
+            }
+        }
+
+        let (device, candidate) = require_single_candidate(candidates)?;
+        match probe_candidate(
+            &device,
+            candidate.vendor,
+            candidate.product,
+            candidate.interface,
+            candidate.alternate_setting,
+            candidate.bulk_in,
+            candidate.bulk_out,
+            candidate.max_packet,
+            expected,
+        )? {
+            Some(report) => Ok(report),
+            None => Err(format!(
                 "classic KDUSB interface found, but NAME= reply did not match '{expected}'"
-            ))
-        } else {
-            Err("no supported classic KDUSB dc/02/ff interface found".to_string())
+            )),
         }
     }
 
@@ -386,6 +417,14 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn single_candidate_guard_rejects_ambiguity_before_probe() {
+            assert_eq!(require_single_candidate(vec![7u8]).unwrap(), 7);
+            assert!(require_single_candidate::<u8>(Vec::new()).is_err());
+            let err = require_single_candidate(vec![1u8, 2u8]).unwrap_err();
+            assert!(err.contains("refusing ambiguous multi-candidate NAME? probing"));
+        }
 
         #[test]
         fn exact_clsa0102_reply_parses() {
