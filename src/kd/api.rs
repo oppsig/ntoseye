@@ -238,7 +238,6 @@ pub struct Version {
     pub debugger_data_list: u64,
 }
 
-
 fn recv_manipulate_reply_once(
     framing: &mut KdFraming<impl Read + Write>,
     requested_processor: u16,
@@ -668,7 +667,6 @@ pub fn restore_breakpoint<T: Read + Write>(
 }
 
 /// `DbgKdContinueApi2`
-
 pub fn continue_api2_once<T: Read + Write>(
     framing: &mut KdFraming<T>,
     processor: u16,
