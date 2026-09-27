@@ -300,7 +300,6 @@ impl<T: Read + Write> KdFraming<T> {
         Ok(())
     }
 
-
     /// Send exactly one KD data packet and wait for one matching transport ACK.
     ///
     /// Unlike `send_data`, this never retransmits on timeout, RESEND, RESET,
@@ -688,7 +687,6 @@ impl<T: Read + Write> KdFraming<T> {
         Ok(())
     }
 
-
     fn recv_any_no_repair(&mut self) -> Result<Received> {
         let leader = self.read_packet_leader()?;
         self.sync_kdnet_session();
@@ -709,18 +707,14 @@ impl<T: Read + Write> KdFraming<T> {
                 PACKET_TYPE_KD_RESEND => Received::Resend,
                 PACKET_TYPE_KD_RESET => Received::Reset,
                 other => {
-                    return Err(Error::Kd(format!(
-                        "unknown control packet type {other:#x}"
-                    )));
+                    return Err(Error::Kd(format!("unknown control packet type {other:#x}")));
                 }
             });
         }
 
         let len = header.byte_count as usize;
         if len > PACKET_MAX_SIZE {
-            return Err(Error::Kd(format!(
-                "inbound packet too large: {len} bytes"
-            )));
+            return Err(Error::Kd(format!("inbound packet too large: {len} bytes")));
         }
 
         let mut payload = vec![0u8; len];
@@ -1403,5 +1397,4 @@ mod tests {
         assert!(err.to_string().contains("checksum mismatch"));
         assert!(framing.transport.outbound.is_empty());
     }
-
 }
