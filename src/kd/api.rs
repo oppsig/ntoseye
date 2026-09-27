@@ -238,6 +238,75 @@ pub struct Version {
     pub debugger_data_list: u64,
 }
 
+
+fn recv_manipulate_reply_once(
+    framing: &mut KdFraming<impl Read + Write>,
+    requested_processor: u16,
+) -> Result<(ManipulateHeader, [u8; MANIPULATE_HEADER_SIZE], Vec<u8>)> {
+    let pkt = framing.recv_data_once()?;
+    if pkt.packet_type != PACKET_TYPE_KD_STATE_MANIPULATE {
+        return Err(Error::Kd(format!(
+            "one-shot manipulate reply expected packet type {}, got {}",
+            PACKET_TYPE_KD_STATE_MANIPULATE, pkt.packet_type
+        )));
+    }
+
+    let parsed = ManipulateHeader::decode(&pkt.payload)?;
+    if parsed.processor != requested_processor {
+        return Err(Error::Kd(format!(
+            "reply processor mismatch: expected {}, got {}",
+            requested_processor, parsed.processor
+        )));
+    }
+
+    let mut reply_data = pkt.payload;
+    let reply_header: [u8; MANIPULATE_HEADER_SIZE] = reply_data
+        [..MANIPULATE_HEADER_SIZE]
+        .try_into()
+        .expect("length checked by decode");
+    reply_data.drain(..MANIPULATE_HEADER_SIZE);
+    Ok((parsed, reply_header, reply_data))
+}
+
+fn send_manipulate_once(
+    framing: &mut KdFraming<impl Read + Write>,
+    header: &[u8; MANIPULATE_HEADER_SIZE],
+    data: &[u8],
+) -> Result<(ManipulateHeader, [u8; MANIPULATE_HEADER_SIZE], Vec<u8>)> {
+    let requested_processor = read_u16(header, 6);
+    let mut payload = Vec::with_capacity(MANIPULATE_HEADER_SIZE + data.len());
+    payload.extend_from_slice(header);
+    payload.extend_from_slice(data);
+    framing.send_data_once(PACKET_TYPE_KD_STATE_MANIPULATE, &payload)?;
+    recv_manipulate_reply_once(framing, requested_processor)
+}
+
+pub fn get_version_once<T: Read + Write>(
+    framing: &mut KdFraming<T>,
+    processor: u16,
+) -> Result<Version> {
+    let header = make_header(DBGKD_GET_VERSION, processor);
+    let (parsed, reply_header, _) = send_manipulate_once(framing, &header, &[])?;
+    check_status(&parsed, DBGKD_GET_VERSION)?;
+
+    let u = UNION_OFFSET;
+    Ok(Version {
+        major: read_u16(&reply_header, u),
+        minor: read_u16(&reply_header, u + 2),
+        protocol_version: reply_header[u + 4],
+        kd_secondary_version: reply_header[u + 5],
+        flags: read_u16(&reply_header, u + 6),
+        machine_type: read_u16(&reply_header, u + 8),
+        max_packet_type: reply_header[u + 10],
+        max_state_change: reply_header[u + 11],
+        max_manipulate: reply_header[u + 12],
+        simulation: reply_header[u + 13],
+        kern_base: read_u64(&reply_header, u + 16),
+        ps_loaded_module_list: read_u64(&reply_header, u + 24),
+        debugger_data_list: read_u64(&reply_header, u + 32),
+    })
+}
+
 pub fn get_version<T: Read + Write>(framing: &mut KdFraming<T>, processor: u16) -> Result<Version> {
     let header = make_header(DBGKD_GET_VERSION, processor);
     let (parsed, reply_header, _) = send_manipulate(framing, &header, &[])?;
@@ -599,6 +668,21 @@ pub fn restore_breakpoint<T: Read + Write>(
 }
 
 /// `DbgKdContinueApi2`
+
+pub fn continue_api2_once<T: Read + Write>(
+    framing: &mut KdFraming<T>,
+    processor: u16,
+    continue_status: u32,
+    trace: bool,
+    dr7: u64,
+) -> Result<()> {
+    let mut header = make_header(DBGKD_CONTINUE_API2, processor);
+    write_u32(&mut header, UNION_OFFSET, continue_status);
+    write_u32(&mut header, UNION_OFFSET + 4, if trace { 1 } else { 0 });
+    write_u64(&mut header, UNION_OFFSET + 8, dr7);
+    framing.send_data_once(PACKET_TYPE_KD_STATE_MANIPULATE, &header)
+}
+
 pub fn continue_api2<T: Read + Write>(
     framing: &mut KdFraming<T>,
     processor: u16,
