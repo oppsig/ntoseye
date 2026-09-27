@@ -259,8 +259,7 @@ fn recv_manipulate_reply_once(
     }
 
     let mut reply_data = pkt.payload;
-    let reply_header: [u8; MANIPULATE_HEADER_SIZE] = reply_data
-        [..MANIPULATE_HEADER_SIZE]
+    let reply_header: [u8; MANIPULATE_HEADER_SIZE] = reply_data[..MANIPULATE_HEADER_SIZE]
         .try_into()
         .expect("length checked by decode");
     reply_data.drain(..MANIPULATE_HEADER_SIZE);
