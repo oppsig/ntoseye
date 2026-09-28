@@ -518,9 +518,9 @@ pub mod linux {
     const REDISCOVERY_POLLS: usize = 20;
     const REDISCOVERY_INTERVAL: Duration = Duration::from_millis(250);
 
-    struct Candidate {
-        device: Device<GlobalContext>,
-        selection: DeviceSelection,
+    pub(crate) struct Candidate {
+        pub(crate) device: Device<GlobalContext>,
+        pub(crate) selection: DeviceSelection,
     }
 
     pub struct RusbProbeBackend {
@@ -544,7 +544,9 @@ pub mod linux {
             }
         }
 
-        fn candidates(expected_port: Option<&[u8]>) -> Result<Vec<Candidate>, TransportFault> {
+        pub(crate) fn candidates(
+            expected_port: Option<&[u8]>,
+        ) -> Result<Vec<Candidate>, TransportFault> {
             let devices = rusb::devices().map_err(|err| classify_rusb_error("enumerate", err))?;
             let mut candidates = Vec::new();
             for device in devices.iter() {
