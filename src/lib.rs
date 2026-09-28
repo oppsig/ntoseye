@@ -172,6 +172,7 @@ pub mod host;
 pub mod kd;
 pub mod kdusb_endpoint_recreation;
 pub mod kdusb_probe;
+pub mod kdusb_same_configuration_live;
 pub mod kuser_shared;
 pub mod layout;
 #[cfg(feature = "mcp")]
