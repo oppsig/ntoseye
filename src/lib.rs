@@ -170,6 +170,7 @@ pub mod gdbserver;
 pub mod guest;
 pub mod host;
 pub mod kd;
+pub mod kdusb_probe;
 pub mod kuser_shared;
 pub mod layout;
 #[cfg(feature = "mcp")]

@@ -411,9 +411,7 @@ mod linux {
         KDUSB_HARDWARE_IDS.contains(&(vendor, product))
     }
 
-    fn open_named_device(
-        target_name: &str,
-    ) -> io::Result<(RusbBulkIo, BulkEndpoints, Vec<u8>)> {
+    fn open_named_device(target_name: &str) -> io::Result<(RusbBulkIo, BulkEndpoints, Vec<u8>)> {
         let devices = rusb::devices().map_err(|err| usb_error("enumerating USB devices", err))?;
         let mut saw_interface = false;
         let mut last_error = None;
@@ -616,7 +614,24 @@ mod linux {
             rusb::Error::Timeout => io::ErrorKind::TimedOut,
             _ => io::ErrorKind::Other,
         };
-        io::Error::new(kind, format!("{context}: {err}"))
+        let operation = match context {
+            "KDUSB bulk read" => "kdusb-stream-read",
+            "KDUSB bulk write" => "kdusb-stream-write",
+            "enumerating USB devices" => "kdusb-enumerate",
+            "reading USB device descriptor" => "kdusb-read-device-descriptor",
+            "reading active USB configuration" => "kdusb-read-active-configuration",
+            "opening classic KDUSB device" => "kdusb-open",
+            "checking KDUSB interface kernel-driver ownership" => "kdusb-kernel-driver-check",
+            "claiming KDUSB interface" => "kdusb-claim-interface",
+            "selecting KDUSB alternate setting" => "kdusb-set-alternate-setting",
+            "sending KDUSB NAME? probe" => "kdusb-name-write",
+            "reading KDUSB NAME= reply" => "kdusb-name-read",
+            _ => "kdusb-operation",
+        };
+        io::Error::new(
+            kind,
+            crate::kdusb_probe::linux::classify_rusb_error(operation, err),
+        )
     }
 
     #[cfg(test)]
