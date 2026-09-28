@@ -9,7 +9,9 @@
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("ntoseye-kdusb-passive-packet-observer-transport-r1 is supported only on Linux hosts");
+    eprintln!(
+        "ntoseye-kdusb-passive-packet-observer-transport-r1 is supported only on Linux hosts"
+    );
     std::process::exit(2);
 }
 
@@ -872,17 +874,19 @@ mod linux {
             let mut optional_nul = false;
             let mut duplicate_names = 0usize;
             let mut stream = Vec::new();
-            assert!(append_bootstrap_transfer(
-                "CLSA0102_USB",
-                b"NAME=OTHER\0\0",
-                &mut kind,
-                &mut name,
-                &mut pending,
-                &mut optional_nul,
-                &mut duplicate_names,
-                &mut stream,
-            )
-            .is_err());
+            assert!(
+                append_bootstrap_transfer(
+                    "CLSA0102_USB",
+                    b"NAME=OTHER\0\0",
+                    &mut kind,
+                    &mut name,
+                    &mut pending,
+                    &mut optional_nul,
+                    &mut duplicate_names,
+                    &mut stream,
+                )
+                .is_err()
+            );
         }
 
         #[test]
