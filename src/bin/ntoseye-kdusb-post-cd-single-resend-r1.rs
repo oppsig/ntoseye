@@ -46,8 +46,8 @@ mod linux {
     const OBSERVED_NEW_STATE: u32 = 0x0000_3031;
 
     const KD_RESEND_PACKET: [u8; 16] = [
-        0x69, 0x69, 0x69, 0x69, 0x05, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x69, 0x69, 0x69, 0x69, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
     ];
 
     const MAX_RESEND_TX: usize = 1;
@@ -427,9 +427,7 @@ mod linux {
         };
 
         let (trailer_present, trailer_valid, extra_start) =
-            if header.leader == DATA_PACKET_LEADER
-                && payload_complete
-                && bytes.len() > payload_end
+            if header.leader == DATA_PACKET_LEADER && payload_complete && bytes.len() > payload_end
             {
                 (
                     true,
@@ -726,7 +724,10 @@ mod linux {
 
         #[test]
         fn resend_packet_is_exact() {
-            assert_eq!(hex::encode(KD_RESEND_PACKET), "69696969050000000000000000000000");
+            assert_eq!(
+                hex::encode(KD_RESEND_PACKET),
+                "69696969050000000000000000000000"
+            );
         }
 
         #[test]
