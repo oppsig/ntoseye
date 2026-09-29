@@ -489,15 +489,14 @@ mod linux {
 
             post_reset_stream.extend_from_slice(&response[..received]);
             loop {
-                let Some(packet) = match try_complete_packet(&post_reset_stream) {
-                    Ok(packet) => packet,
+                let packet = match try_complete_packet(&post_reset_stream) {
+                    Ok(Some(packet)) => packet,
+                    Ok(None) => break,
                     Err(e) => {
                         report.result = "RESYNC_FRAMING_INVALID";
                         report.error = Some(e);
                         return;
                     }
-                } else {
-                    break;
                 };
 
                 let consumed = packet.total_bytes;
@@ -829,7 +828,7 @@ mod linux {
         #[test]
         fn kd_reset_control_packet_is_exactly_sixteen_bytes() {
             assert_eq!(KD_RESET_PACKET.len(), 16);
-            assert_eq!(KD_RESET_PACKET, control_packet(PACKET_TYPE_KD_RESET, 0).as_slice());
+            assert_eq!(&KD_RESET_PACKET[..], control_packet(PACKET_TYPE_KD_RESET, 0).as_slice());
             let summary = try_complete_packet(&KD_RESET_PACKET).unwrap().unwrap();
             assert_eq!(summary.header.leader, CONTROL_PACKET_LEADER);
             assert_eq!(summary.header.packet_type, PACKET_TYPE_KD_RESET);
