@@ -402,7 +402,17 @@ mod linux {
         Some(calculated == header.checksum)
     }
 
-    fn decode_state_change(packet: &[u8], header: KdHeader) -> (Option<u32>, Option<u16>, Option<u16>, Option<u32>, Option<u64>, Option<u64>) {
+    fn decode_state_change(
+        packet: &[u8],
+        header: KdHeader,
+    ) -> (
+        Option<u32>,
+        Option<u16>,
+        Option<u16>,
+        Option<u32>,
+        Option<u64>,
+        Option<u64>,
+    ) {
         if header.packet_type != 7 || packet.len() < KD_HEADER_SIZE + 32 {
             return (None, None, None, None, None, None);
         }
@@ -475,8 +485,14 @@ mod linux {
                 None
             };
 
-            let (new_state, processor_level, processor, number_processors, thread, program_counter) =
-                decode_state_change(packet, header);
+            let (
+                new_state,
+                processor_level,
+                processor,
+                number_processors,
+                thread,
+                program_counter,
+            ) = decode_state_change(packet, header);
 
             let cb_header_match = header.leader == DATA_PACKET_LEADER
                 && header.packet_type == CB_PACKET_TYPE
