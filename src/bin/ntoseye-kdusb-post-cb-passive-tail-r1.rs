@@ -436,7 +436,11 @@ mod linux {
 
         let Some(first_leader) = find_first_leader(&report.stream, 0) else {
             report.leading_bytes = report.stream.clone();
-            report.result = if report.leading_bytes.iter().all(|&b| b == PACKET_TRAILING_BYTE) {
+            report.result = if report
+                .leading_bytes
+                .iter()
+                .all(|&b| b == PACKET_TRAILING_BYTE)
+            {
                 "LEADING_TRAILER_ONLY".into()
             } else {
                 "UNCLASSIFIED_PASSIVE_DATA".into()
@@ -485,14 +489,8 @@ mod linux {
                 None
             };
 
-            let (
-                new_state,
-                processor_level,
-                processor,
-                number_processors,
-                thread,
-                program_counter,
-            ) = decode_state_change(packet, header);
+            let (new_state, processor_level, processor, number_processors, thread, program_counter) =
+                decode_state_change(packet, header);
 
             let cb_header_match = header.leader == DATA_PACKET_LEADER
                 && header.packet_type == CB_PACKET_TYPE
@@ -524,7 +522,10 @@ mod linux {
         }
 
         let leading_trailer = !report.leading_bytes.is_empty()
-            && report.leading_bytes.iter().all(|&b| b == PACKET_TRAILING_BYTE);
+            && report
+                .leading_bytes
+                .iter()
+                .all(|&b| b == PACKET_TRAILING_BYTE);
         let cb_complete = report.packets.iter().any(|p| {
             p.cb_header_match
                 && p.complete
@@ -538,8 +539,7 @@ mod linux {
         let any_complete_valid = report.packets.iter().any(|p| {
             p.complete
                 && p.checksum_valid == Some(true)
-                && (p.header.leader == CONTROL_PACKET_LEADER
-                    || p.trailer_valid == Some(true))
+                && (p.header.leader == CONTROL_PACKET_LEADER || p.trailer_valid == Some(true))
         });
 
         report.result = if leading_trailer && cb_complete {
