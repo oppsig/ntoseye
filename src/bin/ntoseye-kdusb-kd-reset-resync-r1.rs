@@ -57,8 +57,8 @@ mod linux {
 
     const KD_RESET_PACKET: [u8; 16] = [
         0x69, 0x69, 0x69, 0x69, // CONTROL_PACKET_LEADER
-        0x06, 0x00,             // PACKET_TYPE_KD_RESET
-        0x00, 0x00,             // ByteCount = 0
+        0x06, 0x00, // PACKET_TYPE_KD_RESET
+        0x00, 0x00, // ByteCount = 0
         0x00, 0x00, 0x00, 0x00, // PacketId = 0
         0x00, 0x00, 0x00, 0x00, // Checksum = 0
     ];
@@ -148,9 +148,7 @@ mod linux {
             return 0;
         }
         if args != [LIVE_FLAG, REQUIRED_TARGET] {
-            eprintln!(
-                "usage: ntoseye-kdusb-kd-reset-resync-r1 [{LIVE_FLAG} {REQUIRED_TARGET}]"
-            );
+            eprintln!("usage: ntoseye-kdusb-kd-reset-resync-r1 [{LIVE_FLAG} {REQUIRED_TARGET}]");
             return 2;
         }
 
@@ -668,9 +666,7 @@ mod linux {
             CONTROL_PACKET_LEADER
                 if matches!(
                     header.packet_type,
-                    PACKET_TYPE_KD_ACKNOWLEDGE
-                        | PACKET_TYPE_KD_RESEND
-                        | PACKET_TYPE_KD_RESET
+                    PACKET_TYPE_KD_ACKNOWLEDGE | PACKET_TYPE_KD_RESEND | PACKET_TYPE_KD_RESET
                 ) && header.byte_count == 0
                     && header.checksum == 0 =>
             {
@@ -723,7 +719,10 @@ mod linux {
         println!("{prefix}_TOTAL_BYTES={}", packet.total_bytes);
         println!("{prefix}_LEADER=0x{:08x}", packet.header.leader);
         println!("{prefix}_TYPE=0x{:04x}", packet.header.packet_type);
-        println!("{prefix}_SEMANTIC={}", packet_label(packet.header.packet_type));
+        println!(
+            "{prefix}_SEMANTIC={}",
+            packet_label(packet.header.packet_type)
+        );
         println!("{prefix}_BYTE_COUNT={}", packet.header.byte_count);
         println!("{prefix}_PACKET_ID=0x{:08x}", packet.header.packet_id);
         println!("{prefix}_CHECKSUM=0x{:08x}", packet.header.checksum);
@@ -789,11 +788,7 @@ mod linux {
             println!("ERROR={error}");
         }
 
-        print_safety_markers(
-            true,
-            report.name_probe_sent,
-            report.kd_control_reset_sent,
-        );
+        print_safety_markers(true, report.name_probe_sent, report.kd_control_reset_sent);
     }
 
     #[cfg(test)]
@@ -828,7 +823,10 @@ mod linux {
         #[test]
         fn kd_reset_control_packet_is_exactly_sixteen_bytes() {
             assert_eq!(KD_RESET_PACKET.len(), 16);
-            assert_eq!(&KD_RESET_PACKET[..], control_packet(PACKET_TYPE_KD_RESET, 0).as_slice());
+            assert_eq!(
+                &KD_RESET_PACKET[..],
+                control_packet(PACKET_TYPE_KD_RESET, 0).as_slice()
+            );
             let summary = try_complete_packet(&KD_RESET_PACKET).unwrap().unwrap();
             assert_eq!(summary.header.leader, CONTROL_PACKET_LEADER);
             assert_eq!(summary.header.packet_type, PACKET_TYPE_KD_RESET);
@@ -852,9 +850,7 @@ mod linux {
             let mut bootstrap = BootstrapAssembly::default();
             bootstrap.append(REQUIRED_TARGET, b"NAME=CLSA").unwrap();
             assert!(bootstrap.name_target.is_none());
-            bootstrap
-                .append(REQUIRED_TARGET, b"0102_USB\0\0")
-                .unwrap();
+            bootstrap.append(REQUIRED_TARGET, b"0102_USB\0\0").unwrap();
             assert_eq!(bootstrap.name_target.as_deref(), Some(REQUIRED_TARGET));
         }
 
