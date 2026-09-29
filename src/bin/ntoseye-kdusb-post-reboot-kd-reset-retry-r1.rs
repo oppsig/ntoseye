@@ -142,7 +142,9 @@ mod linux {
             return 0;
         }
         if args != [LIVE_FLAG, REQUIRED_TARGET] {
-            eprintln!("usage: ntoseye-kdusb-post-reboot-kd-reset-retry-r1 [{LIVE_FLAG} {REQUIRED_TARGET}]");
+            eprintln!(
+                "usage: ntoseye-kdusb-post-reboot-kd-reset-retry-r1 [{LIVE_FLAG} {REQUIRED_TARGET}]"
+            );
             return 2;
         }
         let report = match observe(REQUIRED_TARGET) {
