@@ -818,9 +818,7 @@ mod linux {
                 if (dd.vendor_id(), dd.product_id()) != (VID, PID) {
                     continue;
                 }
-                if device.bus_number() != 6
-                    || device.port_numbers().ok().as_deref() != Some(&[1])
-                {
+                if device.bus_number() != 6 || device.port_numbers().ok().as_deref() != Some(&[1]) {
                     continue;
                 }
                 let config = device.active_config_descriptor().map_err(|e| {
@@ -872,9 +870,7 @@ mod linux {
             let device = candidates.remove(0);
             let bus = device.bus_number();
             let address = device.address();
-            let handle = device
-                .open()
-                .map_err(|e| map_open_error("open", e))?;
+            let handle = device.open().map_err(|e| map_open_error("open", e))?;
             match handle.kernel_driver_active(INTERFACE) {
                 Ok(true) => {
                     return Err((
