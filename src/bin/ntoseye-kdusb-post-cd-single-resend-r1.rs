@@ -427,8 +427,15 @@ mod linux {
         };
 
         let (trailer_present, trailer_valid, extra_start) =
-            if header.leader == DATA_PACKET_LEADER && payload_complete && bytes.len() > payload_end {
-                (true, Some(bytes[payload_end] == PACKET_TRAILING_BYTE), payload_end + 1)
+            if header.leader == DATA_PACKET_LEADER
+                && payload_complete
+                && bytes.len() > payload_end
+            {
+                (
+                    true,
+                    Some(bytes[payload_end] == PACKET_TRAILING_BYTE),
+                    payload_end + 1,
+                )
             } else {
                 (false, None, payload_end.min(bytes.len()))
             };
