@@ -75,7 +75,7 @@ use transport::KdTransport;
 
 mod debug_io;
 pub use debug_io::*;
-mod file_io;
+pub mod file_io;
 pub use file_io::*;
 mod event_loop;
 pub use event_loop::*;
