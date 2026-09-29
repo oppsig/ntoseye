@@ -1178,6 +1178,16 @@ mod linux {
             );
         }
         #[test]
+        fn io_and_pipe_are_preserved_as_distinct_statuses() {
+            let io = observe_transfer(Err(UsbError::Io), vec![0; 2], 2);
+            let pipe = observe_transfer(Err(UsbError::Pipe), vec![0; 2], 2);
+            assert_eq!(io.status, Status::Io);
+            assert_eq!(pipe.status, Status::Pipe);
+            assert_eq!(io.error.as_deref(), Some("rusb::Error::Io"));
+            assert_eq!(pipe.error.as_deref(), Some("rusb::Error::Pipe"));
+        }
+
+        #[test]
         fn constants_are_exact() {
             assert_eq!(NAME, b"NAME?");
             assert_eq!(PROBES.len(), 19);
