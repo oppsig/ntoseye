@@ -4,8 +4,6 @@
 //! module does not concatenate completions and does not require the serial
 //! transport's optional `0xaa` byte.
 
-use std::collections::BTreeSet;
-
 pub const DATA_LEADER: u32 = 0x3030_3030;
 pub const CONTROL_LEADER: u32 = 0x6969_6969;
 pub const INITIAL_PACKET_ID: u32 = 0x8080_0000;
@@ -125,12 +123,13 @@ pub fn classify_usb_transfer(bytes: &[u8]) -> Classification {
     if bytes.is_empty() {
         return Classification::Empty;
     }
-    if bytes.starts_with(b"NAME=") {
-        let suffix = &bytes[5..];
+    if bytes.starts_with(b"NAME") {
+        let suffix = bytes.get(5..).unwrap_or_default();
         let name = suffix
             .iter()
             .position(|byte| *byte == 0)
             .and_then(|end| std::str::from_utf8(&suffix[..end]).ok())
+            .filter(|name| bytes.starts_with(b"NAME=") && !name.is_empty() && name.len() <= 24)
             .map(ToOwned::to_owned);
         return Classification::Name { name };
     }
@@ -147,7 +146,7 @@ pub fn classify_usb_transfer(bytes: &[u8]) -> Classification {
     let payload = bytes[16..payload_end].to_vec();
     let tail = bytes.get(declared_end..).unwrap_or_default();
     let trailer_value = tail.first().copied();
-    let trailer_present = trailer_value == Some(TRAILER);
+    let trailer_present = header.leader == DATA_LEADER && trailer_value == Some(TRAILER);
     let extra_from = usize::from(trailer_present);
     let extra_bytes = tail.get(extra_from..).unwrap_or_default().to_vec();
     let checksum_valid = (header.leader == DATA_LEADER && payload_complete)
@@ -216,8 +215,9 @@ pub fn control(packet_type: u16, packet_id: u32) -> [u8; 16] {
     bytes
 }
 
-/// Serialize the sole whitelisted query. KDUSB observations omit the serial
-/// trailer, so this returns header+payload and does not append `0xaa`.
+/// Serialize the whitelisted GetVersion header+payload for offline analysis.
+/// Whether an outgoing legacy KDUSB transfer must append the classic serial
+/// trailer remains unverified. The live engine does not call this serializer.
 pub fn get_version_query(packet_id: u32, processor: u16) -> Vec<u8> {
     let mut payload = vec![0u8; 56];
     payload[0..4].copy_from_slice(&DBGKD_GET_VERSION_API.to_le_bytes());
@@ -250,13 +250,15 @@ pub enum PacketIdDisposition {
 #[derive(Debug, Default)]
 pub struct PacketIdTracker {
     expected: Option<u32>,
-    seen: BTreeSet<u32>,
+    last_accepted: Option<u32>,
 }
 
 impl PacketIdTracker {
     pub fn observe(&mut self, packet_id: u32) -> PacketIdDisposition {
         let base = packet_id & !SYNC_PACKET_ID;
-        if self.seen.contains(&packet_id) || self.seen.contains(&base) {
+        // Classic KD reuses IDs on every second *new* packet. Comparing
+        // against a lifetime set incorrectly rejects the third packet.
+        if self.last_accepted == Some(base) {
             return PacketIdDisposition::Duplicate;
         }
         let sync = packet_id & SYNC_PACKET_ID != 0;
@@ -267,12 +269,214 @@ impl PacketIdTracker {
         } else {
             PacketIdDisposition::OutOfSequence
         };
-        self.seen.insert(packet_id);
-        self.seen.insert(base);
         if disposition != PacketIdDisposition::OutOfSequence {
             self.expected = Some(base ^ 1);
+            self.last_accepted = Some(base);
         }
         disposition
+    }
+}
+
+/// The limits are applied to actual protocol operations, including the
+/// authoritative initial ACK. A TX reservation is never retried automatically.
+#[derive(Clone, Debug)]
+pub struct Budgets {
+    pub reads: usize,
+    pub control_tx: usize,
+    pub data_acks: usize,
+    pub query_tx: usize,
+    pub max_reads: usize,
+    pub max_control_tx: usize,
+    pub max_data_acks: usize,
+    pub max_query_tx: usize,
+    pub max_active_ms: u64,
+}
+
+impl Default for Budgets {
+    fn default() -> Self {
+        Self {
+            reads: 0,
+            control_tx: 0,
+            data_acks: 0,
+            query_tx: 0,
+            max_reads: 64,
+            max_control_tx: 16,
+            max_data_acks: 16,
+            max_query_tx: 1,
+            max_active_ms: 60_000,
+        }
+    }
+}
+
+impl Budgets {
+    pub fn reserve_read(&mut self, elapsed_ms: u64) -> Result<(), &'static str> {
+        if elapsed_ms >= self.max_active_ms {
+            return Err("ACTIVE_TIME_BUDGET_REACHED");
+        }
+        if self.reads >= self.max_reads {
+            return Err("READ_BUDGET_REACHED");
+        }
+        self.reads += 1;
+        Ok(())
+    }
+
+    pub fn reserve_ack(&mut self, elapsed_ms: u64) -> Result<(), &'static str> {
+        if elapsed_ms >= self.max_active_ms {
+            return Err("ACTIVE_TIME_BUDGET_REACHED");
+        }
+        if self.control_tx >= self.max_control_tx {
+            return Err("CONTROL_TX_BUDGET_REACHED");
+        }
+        if self.data_acks >= self.max_data_acks {
+            return Err("DATA_ACK_BUDGET_REACHED");
+        }
+        self.control_tx += 1;
+        self.data_acks += 1;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Receive(&'static str),
+    Acknowledge {
+        packet_id: u32,
+        disposition: PacketIdDisposition,
+    },
+    Stop(&'static str),
+}
+
+/// Pure conversation policy, shared by USB execution and transcript replay.
+/// The first ACK is for CB's retained header, whose entire payload is unavailable.
+#[derive(Debug)]
+pub struct Conversation {
+    pub ids: PacketIdTracker,
+    last_packet: Option<(u32, Vec<u8>)>,
+    initial_retransmit: bool,
+    timeouts: usize,
+    duplicate_streak: usize,
+    pub processor: u16,
+}
+
+impl Default for Conversation {
+    fn default() -> Self {
+        let mut ids = PacketIdTracker::default();
+        ids.observe(INITIAL_PACKET_ID | SYNC_PACKET_ID);
+        Self {
+            ids,
+            last_packet: None,
+            initial_retransmit: true,
+            timeouts: 0,
+            duplicate_streak: 0,
+            processor: 13,
+        }
+    }
+}
+
+impl Conversation {
+    pub fn timeout(&mut self) -> Decision {
+        self.timeouts += 1;
+        if self.timeouts >= 4 {
+            // Payload layout is defined, but host->target KDUSB trailer
+            // framing is not yet verified by a public implementation/capture.
+            Decision::Stop("SILENCE_QUERY_FRAMING_UNVERIFIED")
+        } else {
+            Decision::Receive("bounded receive-only opportunity before any query")
+        }
+    }
+
+    pub fn receive(&mut self, class: &Classification, bytes: &[u8]) -> Decision {
+        if matches!(class, Classification::Empty) {
+            return Decision::Receive("USB ZLP is independently retained");
+        }
+        self.timeouts = 0;
+        match class {
+            Classification::Name { name } => {
+                if name.as_deref().is_some_and(|n| n != "CLSA0102_USB") {
+                    Decision::Stop("NAME_TARGET_IDENTITY_MISMATCH")
+                } else {
+                    Decision::Receive("NAME/NAME-like packet retained independently")
+                }
+            }
+            Classification::Unknown => Decision::Stop("UNKNOWN_TRANSPORT_PACKET"),
+            Classification::Empty => unreachable!(),
+            Classification::Kd(p) if p.header.leader == CONTROL_LEADER => {
+                if p.header.byte_count != 0 || p.header.checksum != 0 || !p.extra_bytes.is_empty() {
+                    return Decision::Stop("MALFORMED_CONTROL_PACKET");
+                }
+                match p.header.packet_type {
+                    KD_ACKNOWLEDGE => {
+                        Decision::Receive("stray ACK classified; no query is in flight")
+                    }
+                    KD_RESET => Decision::Stop("TARGET_RESET_OBSERVED_NO_AUTOMATIC_RESPONSE"),
+                    KD_RESEND => Decision::Stop("TARGET_RESEND_NO_VERIFIED_DATA_REQUEST_IN_FLIGHT"),
+                    _ => Decision::Stop("UNKNOWN_KD_CONTROL"),
+                }
+            }
+            Classification::Kd(p) => {
+                if p.header.byte_count > 4000 {
+                    return Decision::Stop("KD_PAYLOAD_OVER_LIMIT");
+                }
+                if !p.payload_complete {
+                    return Decision::Stop("INCOMPLETE_USB_TRANSPORT_PACKET");
+                }
+                if p.checksum_valid != Some(true) {
+                    return Decision::Stop("INVALID_CHECKSUM_NO_AUTOMATIC_RESEND");
+                }
+                if !p.extra_bytes.is_empty() {
+                    return Decision::Stop("UNVERIFIED_BYTES_AFTER_KD_PAYLOAD");
+                }
+                let disposition = self.ids.observe(p.header.packet_id);
+                if disposition == PacketIdDisposition::OutOfSequence {
+                    return Decision::Stop("OUT_OF_SEQUENCE_PACKET_ID");
+                }
+                if disposition == PacketIdDisposition::Duplicate {
+                    if let Some((id, prior)) = &self.last_packet {
+                        if *id == (p.header.packet_id & !SYNC_PACKET_ID) && prior != &p.payload {
+                            return Decision::Stop("SAME_PACKET_ID_DIFFERENT_PAYLOAD");
+                        }
+                    }
+                    // CB's complete bytes are missing. A complete retransmit
+                    // may validate its header/payload but is not ACKed again.
+                    if self.initial_retransmit && self.last_packet.is_none() {
+                        self.last_packet =
+                            Some((p.header.packet_id & !SYNC_PACKET_ID, p.payload.clone()));
+                    }
+                    self.duplicate_streak += 1;
+                    if self.duplicate_streak >= 2 {
+                        return Decision::Stop("REPEATED_ALREADY_ACKNOWLEDGED_PACKET");
+                    }
+                    return Decision::Receive(
+                        "duplicate/retransmission; previous ACK is not repeated",
+                    );
+                }
+                self.duplicate_streak = 0;
+                self.initial_retransmit = false;
+                self.last_packet = Some((p.header.packet_id & !SYNC_PACKET_ID, p.payload.clone()));
+                let _ = bytes; // Raw bytes belong to the recorder, not this state.
+                if let Some(state) = &p.state_change {
+                    self.processor = state.processor;
+                }
+                Decision::Acknowledge {
+                    packet_id: p.header.packet_id,
+                    disposition,
+                }
+            }
+        }
+    }
+
+    pub fn after_ack(&self, class: &Classification) -> Option<&'static str> {
+        let Classification::Kd(p) = class else {
+            return None;
+        };
+        match p.header.packet_type {
+            KD_FILE_IO | KD_DEBUG_IO | KD_CONTROL_REQUEST => {
+                Some("UNEXPECTED_SEMANTIC_CLASS_PASSIVE_STOP")
+            }
+            KD_STATE_MANIPULATE => Some("UNSOLICITED_MANIPULATE_PASSIVE_STOP"),
+            KD_STATE_CHANGE64 if p.state_change.is_some() => None,
+            _ => Some("UNKNOWN_KD_SEMANTIC_PASSIVE_STOP"),
+        }
     }
 }
 
@@ -356,6 +560,8 @@ mod tests {
         assert_eq!(ids.observe(0x8080_0800), PacketIdDisposition::FirstSync);
         assert_eq!(ids.observe(0x8080_0800), PacketIdDisposition::Duplicate);
         assert_eq!(ids.observe(0x8080_0001), PacketIdDisposition::Expected);
+        assert_eq!(ids.observe(0x8080_0000), PacketIdDisposition::Expected);
+        assert_eq!(ids.observe(0x8080_0001), PacketIdDisposition::Expected);
         assert_eq!(ids.observe(0x8080_0002), PacketIdDisposition::OutOfSequence);
     }
 
@@ -372,5 +578,126 @@ mod tests {
         assert!(matches!(classify_usb_transfer(&a), Classification::Kd(_)));
         assert!(matches!(classify_usb_transfer(&b), Classification::Kd(_)));
         assert_eq!(classify_usb_transfer(&[]), Classification::Empty);
+    }
+
+    fn with_id(mut packet: Vec<u8>, id: u32) -> Vec<u8> {
+        packet[8..12].copy_from_slice(&id.to_le_bytes());
+        packet
+    }
+
+    #[test]
+    fn conversation_walks_sixteen_toggling_packets() {
+        let mut conv = Conversation::default();
+        for index in 0..16u32 {
+            let mut payload = vec![0; 330];
+            payload[..4].copy_from_slice(&DBGKD_LOAD_SYMBOLS_STATE_CHANGE.to_le_bytes());
+            payload[32] = index as u8;
+            let id = INITIAL_PACKET_ID | ((index + 1) & 1);
+            let bytes = with_id(data(&payload, false), id);
+            assert_eq!(
+                conv.receive(&classify_usb_transfer(&bytes), &bytes),
+                Decision::Acknowledge {
+                    packet_id: id,
+                    disposition: PacketIdDisposition::Expected
+                }
+            );
+            assert!(matches!(
+                conv.receive(&classify_usb_transfer(&bytes), &bytes),
+                Decision::Receive(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn timeout_budget_and_name_interleaving() {
+        let mut conv = Conversation::default();
+        for _ in 0..3 {
+            assert!(matches!(conv.timeout(), Decision::Receive(_)));
+        }
+        let name = b"NAME=CLSA0102_USB\0\0";
+        assert!(matches!(
+            conv.receive(&classify_usb_transfer(name), name),
+            Decision::Receive(_)
+        ));
+        for _ in 0..3 {
+            assert!(matches!(conv.timeout(), Decision::Receive(_)));
+        }
+        assert_eq!(
+            conv.timeout(),
+            Decision::Stop("SILENCE_QUERY_FRAMING_UNVERIFIED")
+        );
+        assert!(matches!(
+            classify_usb_transfer(b"NAME?"),
+            Classification::Name { name: None }
+        ));
+    }
+
+    #[test]
+    fn bounds_are_enforced_before_operations() {
+        let mut budgets = Budgets::default();
+        for _ in 0..64 {
+            budgets.reserve_read(1).unwrap();
+        }
+        assert_eq!(budgets.reserve_read(1), Err("READ_BUDGET_REACHED"));
+        for _ in 0..16 {
+            budgets.reserve_ack(1).unwrap();
+        }
+        assert_eq!(budgets.reserve_ack(1), Err("CONTROL_TX_BUDGET_REACHED"));
+        let mut budgets = Budgets::default();
+        assert_eq!(
+            budgets.reserve_read(60_000),
+            Err("ACTIVE_TIME_BUDGET_REACHED")
+        );
+        assert_eq!(
+            budgets.reserve_ack(60_000),
+            Err("ACTIVE_TIME_BUDGET_REACHED")
+        );
+        assert_eq!(budgets.reads, 0);
+        assert_eq!(budgets.control_tx, 0);
+    }
+
+    #[test]
+    fn corrupt_packets_stop_without_ack_and_full_query_layout() {
+        let mut conv = Conversation::default();
+        let mut bad = with_id(data(&[1; 330], false), INITIAL_PACKET_ID ^ 1);
+        bad[20] ^= 1;
+        assert_eq!(
+            conv.receive(&classify_usb_transfer(&bad), &bad),
+            Decision::Stop("INVALID_CHECKSUM_NO_AUTOMATIC_RESEND")
+        );
+        let incomplete = &bad[..64];
+        assert_eq!(
+            conv.receive(&classify_usb_transfer(incomplete), incomplete),
+            Decision::Stop("INCOMPLETE_USB_TRANSPORT_PACKET")
+        );
+        let mut ack = acknowledge(INITIAL_PACKET_ID).to_vec();
+        ack.push(TRAILER);
+        assert_eq!(
+            conv.receive(&classify_usb_transfer(&ack), &ack),
+            Decision::Stop("MALFORMED_CONTROL_PACKET")
+        );
+        let mut expected = hex::decode("303030300200380000008080840000004631000000000d00").unwrap();
+        expected.resize(72, 0);
+        assert_eq!(get_version_query(INITIAL_PACKET_ID, 13), expected);
+    }
+
+    #[test]
+    fn duplicate_payload_conflict_and_reset_stop() {
+        let mut conv = Conversation::default();
+        let bytes = with_id(data(&[2; 330], false), INITIAL_PACKET_ID ^ 1);
+        assert!(matches!(
+            conv.receive(&classify_usb_transfer(&bytes), &bytes),
+            Decision::Acknowledge { .. }
+        ));
+        let other = with_id(data(&[3; 330], false), INITIAL_PACKET_ID ^ 1);
+        assert_eq!(
+            conv.receive(&classify_usb_transfer(&other), &other),
+            Decision::Stop("SAME_PACKET_ID_DIFFERENT_PAYLOAD")
+        );
+        let reset = control(KD_RESET, 0);
+        assert_eq!(
+            conv.receive(&classify_usb_transfer(&reset), &reset),
+            Decision::Stop("TARGET_RESET_OBSERVED_NO_AUTOMATIC_RESPONSE")
+        );
     }
 }

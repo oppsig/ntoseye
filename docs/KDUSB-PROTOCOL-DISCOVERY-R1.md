@@ -9,8 +9,10 @@ checksum state, optional `0xaa`, extra bytes, NAME replies, state changes,
 manipulate APIs and PacketId sync/duplicate state. It never requires NAME to
 arrive before KD.
 
-Live mode permits the authoritative initial ACK, exact-once ACKs for valid new
-KD data, and one whitelisted `DbgKdGetVersionApi` query. It contains no USB
+Live mode permits the authoritative initial ACK and exact-once ACKs for valid
+new logical KD packets. The GetVersion serializer is tested offline; live query
+transmission is disabled until host-to-target legacy KDUSB trailer framing is
+verified. It contains no USB
 control transfer, reset, clear-halt, detach, endpoint recreation, break-in,
 continue, memory/context write, breakpoint, or FILE_IO reply path.
 
@@ -28,3 +30,8 @@ ntoseye-kdusb-protocol-discovery-r1 \
   --execute-campaign CLSA0102_USB --output-dir DIR
 ```
 
+Both the orchestrator and binary enforce exclusive, global one-time guards.
+Identity, boot, endpoint descriptors, controller ownership and capture health
+are checked before and after every transfer. PacketId tracking permits normal
+bit-0 toggling; only repetitions of the immediately prior logical packet are
+classified as retransmissions. Replay uses the same conversation policy.

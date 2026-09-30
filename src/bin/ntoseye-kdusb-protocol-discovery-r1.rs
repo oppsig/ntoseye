@@ -14,15 +14,14 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use ntoseye::kdusb_discovery::{
-        Classification, DATA_LEADER, INITIAL_PACKET_ID, KD_ACKNOWLEDGE, KD_CONTROL_REQUEST,
-        KD_DEBUG_IO, KD_FILE_IO, KD_RESET, KD_STATE_MANIPULATE, PacketIdDisposition,
-        PacketIdTracker, acknowledge, classify_usb_transfer, get_version_query,
+        Budgets, Classification, Conversation, Decision, acknowledge, classify_usb_transfer,
     };
     use rusb::{Device, Direction, GlobalContext, TransferType};
     use serde_json::{Value, json};
-    use std::collections::BTreeSet;
+    use std::collections::BTreeMap;
     use std::fs::{self, File, OpenOptions};
     use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -46,6 +45,7 @@ mod linux {
         0x69, 0x69, 0x69, 0x69, 0x04, 0x00, 0x00, 0x00, 0x00, 0x08, 0x80, 0x80, 0x00, 0x00, 0x00,
         0x00,
     ];
+    const PROJECT: &str = "/home/kodi/engineering/CLSA0102-Reverse-Engineering-Project";
 
     #[derive(Clone)]
     struct Candidate {
@@ -75,8 +75,8 @@ mod linux {
             fs::create_dir_all(out).map_err(|e| format!("create output directory: {e}"))?;
             let append = |name: &str| {
                 OpenOptions::new()
-                    .create(true)
-                    .append(true)
+                    .create_new(true)
+                    .write(true)
                     .open(out.join(name))
             };
             Ok(Self {
@@ -202,6 +202,8 @@ mod linux {
         println!("MAX_QUERY_TX={MAX_QUERY_TX}");
         println!("ACTIVE_PROTOCOL_SECONDS={ACTIVE_SECONDS}");
         println!("QUERY_WHITELIST=DbgKdGetVersionApi");
+        println!("LIVE_QUERY_FRAMING_VERIFIED=false");
+        println!("PLANNED_QUERY_TX=0");
         println!("NAME_PROBE_MAX_TX=1");
         println!("PLANNED_NAME_TX=0");
         println!("KD_RESEND_PLANNED=false");
@@ -215,6 +217,8 @@ mod linux {
     }
 
     fn campaign(out: &Path) -> Result<String, (&'static str, String)> {
+        let guard = Guard::load(out).map_err(|e| ("PRELIVE_ADMISSION_INVALID", e))?;
+        guard.check().map_err(|e| ("IDENTITY_MISMATCH_ABORT", e))?;
         let mut found = candidates().map_err(|e| ("IDENTITY_MISMATCH_ABORT", e))?;
         if found.len() != 1 {
             return Err((
@@ -226,10 +230,19 @@ mod linux {
             ));
         }
         let c = found.remove(0);
-        if c.alternate != 0 {
+        if c.alternate != 0
+            || c.device.bus_number() != 6
+            || c.device.address() != 8
+            || c.interface != 0
+            || c.bulk_in != 0x81
+            || c.bulk_out != 0x01
+            || c.max_packet != 1024
+            || c.vendor != 0x3495
+            || c.product != 0x00e0
+        {
             return Err((
                 "IDENTITY_MISMATCH_ABORT",
-                "alternate setting is not zero".into(),
+                "descriptor candidate differs from admitted CE identity".into(),
             ));
         }
         let handle = c
@@ -249,7 +262,7 @@ mod linux {
         handle
             .claim_interface(c.interface)
             .map_err(|e| ("OTHER_TRANSPORT_FAULT", format!("claim: {e}")))?;
-        let result = walk(&handle, &c, out);
+        let result = walk(&handle, &c, out, &guard);
         let release = handle.release_interface(c.interface);
         if let Err(e) = release {
             return Err(("OTHER_TRANSPORT_FAULT", format!("release: {e}")));
@@ -261,197 +274,135 @@ mod linux {
         handle: &rusb::DeviceHandle<GlobalContext>,
         c: &Candidate,
         out: &Path,
+        guard: &Guard,
     ) -> Result<String, (&'static str, String)> {
         let mut rec = Recorder::new(out).map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
+        guard.check().map_err(|e| ("IDENTITY_MISMATCH_ABORT", e))?;
+        // Binary-level global protection also prevents a direct second launch
+        // with a different output directory after the shell was consumed.
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(Path::new(PROJECT).join("tmp/phase345-engine-started.txt"))
+            .and_then(|mut file| {
+                writeln!(file, "{}", out.display())?;
+                file.sync_all()
+            })
+            .map_err(|e| ("ENGINE_ALREADY_STARTED_OR_LOCK_FAILURE", e.to_string()))?;
+        let started = Instant::now();
+        let mut budgets = Budgets::default();
+        let mut conv = Conversation::default();
+        budgets
+            .reserve_ack(0)
+            .map_err(|e| ("BUDGET_EXHAUSTED", e.into()))?;
         rec.ledger(
             "send_initial_ack",
             "execute_once",
             "authoritative predecessor requires exact ACK of 0x80800800",
         )
         .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
-        write_exact(handle, c.bulk_out, &FIRST_ACK)
-            .map_err(|e| transport_error("initial ACK", e))?;
-        rec.event(
-            "TX",
+        write_recorded(
+            handle,
             c.bulk_out,
             &FIRST_ACK,
-            "DATA",
-            "sent",
-            "first campaign action; exact predecessor ACK",
-        )
-        .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
-
-        let started = Instant::now();
-        let mut reads = 0usize;
-        let mut control_tx = 1usize;
-        // The authoritative first action successfully acknowledges the
-        // retained CB data packet, so it consumes one data-ACK budget slot.
-        let mut acked_data = 1usize;
-        let mut timeouts = 0usize;
-        let mut ids = PacketIdTracker::default();
-        let mut acked_ids = BTreeSet::new();
-        acked_ids.insert(0x8080_0800u32);
-        let mut query_sent = false;
-        let mut query_ack = false;
+            &mut rec,
+            guard,
+            "exact predecessor ACK; checksum of original CB payload remains unavailable",
+        )?;
         let mut useful_packets = 0usize;
-        let mut stop_reason = "READ_BUDGET_REACHED";
+        let stop_reason;
 
-        while reads < MAX_READS
-            && acked_data < MAX_ACKED_DATA
-            && control_tx <= MAX_CONTROL_TX
-            && started.elapsed() < Duration::from_secs(ACTIVE_SECONDS)
-        {
-            reads += 1;
+        loop {
+            if let Err(reason) = budgets.reserve_read(started.elapsed().as_millis() as u64) {
+                stop_reason = reason;
+                break;
+            }
+            guard.check_recorded(&mut rec)?;
             rec.ledger(
                 "bulk_in",
                 "execute_once",
-                &format!("bounded receive call {reads}/{MAX_READS}"),
+                &format!("bounded receive call {}/{MAX_READS}", budgets.reads),
             )
             .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
             let mut buf = vec![0u8; READ_SIZE];
-            match handle.read_bulk(c.bulk_in, &mut buf, IO_TIMEOUT) {
+            let remaining = Duration::from_secs(ACTIVE_SECONDS).saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                stop_reason = "ACTIVE_TIME_BUDGET_REACHED";
+                break;
+            }
+            match handle.read_bulk(c.bulk_in, &mut buf, IO_TIMEOUT.min(remaining)) {
                 Ok(n) => {
                     buf.truncate(n);
-                    timeouts = 0;
                     let class = classify_usb_transfer(&buf);
-                    let (decision, reason) = decide(&class);
+                    let action = conv.receive(&class, &buf);
+                    let decision = format!("{action:?}");
                     rec.event(
                         "RX",
                         c.bulk_in,
                         &buf,
                         if n == 0 { "ZLP" } else { "DATA" },
-                        decision,
-                        reason,
+                        &decision,
+                        "transport packet retained before protocol decision",
                     )
                     .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
-                    match class {
-                        Classification::Kd(packet) if packet.header.leader == DATA_LEADER => {
+                    guard.check_recorded(&mut rec)?;
+                    match action {
+                        Decision::Acknowledge {
+                            packet_id,
+                            disposition,
+                        } => {
                             useful_packets += 1;
-                            if packet.payload_complete && packet.checksum_valid == Some(false) {
-                                stop_reason = "INVALID_CHECKSUM_RESEND_NOT_PROVEN_SAFE";
-                                break;
-                            }
-                            if !packet.payload_complete {
-                                stop_reason = "INCOMPLETE_USB_TRANSPORT_PACKET";
-                                break;
-                            }
-                            if packet.checksum_valid == Some(true) {
-                                let disposition = ids.observe(packet.header.packet_id);
-                                let duplicate = disposition == PacketIdDisposition::Duplicate;
-                                if !duplicate && !acked_ids.contains(&packet.header.packet_id) {
-                                    if control_tx >= MAX_CONTROL_TX {
-                                        stop_reason = "CONTROL_TX_BUDGET_REACHED";
-                                        break;
-                                    }
-                                    let ack = acknowledge(packet.header.packet_id);
-                                    rec.ledger(
-                                        "ack_valid_kd_data",
-                                        "execute_once",
-                                        &format!(
-                                            "valid checksum; exact packet id 0x{:08x}",
-                                            packet.header.packet_id
-                                        ),
-                                    )
-                                    .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
-                                    write_exact(handle, c.bulk_out, &ack)
-                                        .map_err(|e| transport_error("data ACK", e))?;
-                                    control_tx += 1;
-                                    acked_data += 1;
-                                    acked_ids.insert(packet.header.packet_id);
-                                    rec.event(
-                                        "TX",
-                                        c.bulk_out,
-                                        &ack,
-                                        "DATA",
-                                        "sent",
-                                        "valid new KD data packet acknowledged exactly once",
-                                    )
-                                    .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
-                                }
-                            }
-                            if matches!(
-                                packet.header.packet_type,
-                                KD_FILE_IO | KD_DEBUG_IO | KD_CONTROL_REQUEST
-                            ) {
-                                stop_reason = "UNEXPECTED_SEMANTIC_CLASS_PASSIVE_STOP";
-                                break;
-                            }
-                            if packet.class == "KD_UNKNOWN_TYPE"
-                                || packet
-                                    .manipulate
-                                    .as_ref()
-                                    .is_some_and(|m| m.semantic == "unknown-manipulate-api")
+                            if let Err(reason) =
+                                budgets.reserve_ack(started.elapsed().as_millis() as u64)
                             {
-                                stop_reason = "UNKNOWN_KD_SEMANTIC_PASSIVE_STOP";
+                                stop_reason = reason;
                                 break;
                             }
-                            if packet.header.packet_type == KD_STATE_MANIPULATE
-                                && packet
-                                    .manipulate
-                                    .as_ref()
-                                    .is_some_and(|m| m.api_number == 0x3146)
-                            {
-                                stop_reason = "GET_VERSION_REPLY_CAPTURED";
+                            rec.ledger(
+                                "ack_valid_kd_data",
+                                "execute_once",
+                                &format!(
+                                    "valid checksum; PacketId 0x{packet_id:08x}; {disposition:?}"
+                                ),
+                            )
+                            .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
+                            write_recorded(
+                                handle,
+                                c.bulk_out,
+                                &acknowledge(packet_id),
+                                &mut rec,
+                                guard,
+                                "checksum-valid new logical KD packet ACKed once",
+                            )?;
+                            if let Some(reason) = conv.after_ack(&class) {
+                                stop_reason = reason;
                                 break;
                             }
                         }
-                        Classification::Kd(packet)
-                            if packet.header.packet_type == KD_ACKNOWLEDGE =>
-                        {
-                            if packet.header.packet_id == INITIAL_PACKET_ID {
-                                query_ack = true;
-                            }
-                        }
-                        Classification::Kd(packet) if packet.header.packet_type == KD_RESET => {
-                            stop_reason = "TARGET_RESET_OBSERVED_NO_AUTOMATIC_RESPONSE";
+                        Decision::Stop(reason) => {
+                            stop_reason = reason;
                             break;
                         }
-                        Classification::Unknown => {
-                            stop_reason = "UNKNOWN_TRANSPORT_PACKET";
-                            break;
+                        Decision::Receive(reason) => {
+                            rec.ledger("receive_decision", "passive", reason)
+                                .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
                         }
-                        _ => {}
                     }
                 }
                 Err(rusb::Error::Timeout) => {
-                    timeouts += 1;
+                    let action = conv.timeout();
                     rec.event(
                         "RX",
                         c.bulk_in,
                         &[],
                         "TIMEOUT",
-                        "continue_or_query",
+                        &format!("{action:?}"),
                         "bounded timeout is not a transport fault",
                     )
                     .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
-                    if !query_sent {
-                        let query = get_version_query(INITIAL_PACKET_ID, 13);
-                        rec.ledger(
-                            "send_get_version",
-                            "execute_once",
-                            "initial LoadSymbols packet was ACKed and passive receive made no progress; sole whitelisted query",
-                        )
-                        .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
-                        write_exact(handle, c.bulk_out, &query)
-                            .map_err(|e| transport_error("GetVersion", e))?;
-                        query_sent = true;
-                        rec.event(
-                            "TX",
-                            c.bulk_out,
-                            &query,
-                            "DATA",
-                            "sent",
-                            "DbgKdGetVersionApi query-only handshake request",
-                        )
-                        .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
-                        continue;
-                    }
-                    if timeouts >= 4 {
-                        stop_reason = if query_ack {
-                            "SILENCE_AFTER_GET_VERSION_ACK"
-                        } else {
-                            "SILENCE_AFTER_GET_VERSION"
-                        };
+                    guard.check_recorded(&mut rec)?;
+                    if let Decision::Stop(reason) = action {
+                        stop_reason = reason;
                         break;
                     }
                 }
@@ -467,7 +418,18 @@ mod linux {
                     .map_err(|x| ("EVIDENCE_IO_FAULT", x))?;
                     return Err(("EPROTO_CLASS_TRANSPORT_FAULT", e.to_string()));
                 }
-                Err(e) => return Err(("OTHER_TRANSPORT_FAULT", e.to_string())),
+                Err(e) => {
+                    rec.event(
+                        "RX",
+                        c.bulk_in,
+                        &[],
+                        &format!("{e:?}"),
+                        "stop",
+                        "transport failure; no recovery",
+                    )
+                    .map_err(|x| ("EVIDENCE_IO_FAULT", x))?;
+                    return Err(("OTHER_TRANSPORT_FAULT", e.to_string()));
+                }
             }
         }
 
@@ -477,13 +439,13 @@ mod linux {
             out.join("engine-summary.json"),
             serde_json::to_vec_pretty(&json!({
                 "result":stop_reason,
-                "reads":reads,
-                "control_tx":control_tx,
-                "query_tx":usize::from(query_sent),
-                "acknowledged_data_total":acked_data,
-                "acked_new_data":acked_data.saturating_sub(1),
+                "reads":budgets.reads,
+                "control_tx":budgets.control_tx,
+                "query_tx":budgets.query_tx,
+                "acknowledged_data_total":budgets.data_acks,
+                "acked_new_data":budgets.data_acks.saturating_sub(1),
                 "useful_packets":useful_packets,
-                "query_ack":query_ack,
+                "live_query_framing_verified":false,
                 "vendor":format!("0x{:04x}", c.vendor),
                 "product":format!("0x{:04x}", c.product),
                 "interface":c.interface,
@@ -500,34 +462,194 @@ mod linux {
         Ok(stop_reason.into())
     }
 
-    fn decide(class: &Classification) -> (&'static str, &'static str) {
-        match class {
-            Classification::Kd(packet) if packet.header.leader == DATA_LEADER => (
-                "validate_then_ack_once",
-                "KD data is independently checksum-checked",
-            ),
-            Classification::Name { .. } => {
-                ("retain_and_continue", "NAME may interleave with KD traffic")
-            }
-            Classification::Kd(_) => (
-                "classify_control",
-                "control packet changes conversation state",
-            ),
-            Classification::Empty => ("continue", "USB ZLP is not stream EOF"),
-            Classification::Unknown => ("stop", "wire structure is not verified"),
-        }
-    }
-
-    fn write_exact(
+    fn write_recorded(
         handle: &rusb::DeviceHandle<GlobalContext>,
         endpoint: u8,
         bytes: &[u8],
-    ) -> Result<(), rusb::Error> {
-        let n = handle.write_bulk(endpoint, bytes, IO_TIMEOUT)?;
-        if n != bytes.len() {
-            return Err(rusb::Error::Other);
+        rec: &mut Recorder,
+        guard: &Guard,
+        reason: &str,
+    ) -> Result<(), (&'static str, String)> {
+        guard.check_recorded(rec)?;
+        // Preserve intended bytes and the action BEFORE calling libusb, even
+        // when the actual transfer faults or completes only partially.
+        rec.event("TX", endpoint, bytes, "ATTEMPT", "execute_once", reason)
+            .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
+        match handle.write_bulk(endpoint, bytes, IO_TIMEOUT) {
+            Ok(n) => {
+                let status = if n == bytes.len() {
+                    "SUCCESS"
+                } else {
+                    "SHORT_WRITE"
+                };
+                rec.event(
+                    "TX_STATUS",
+                    endpoint,
+                    &[],
+                    status,
+                    "completion",
+                    &format!("actual={n}; requested={}", bytes.len()),
+                )
+                .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
+                if n != bytes.len() {
+                    return Err(("SHORT_WRITE", format!("{n}/{}", bytes.len())));
+                }
+            }
+            Err(error) => {
+                rec.event(
+                    "TX_STATUS",
+                    endpoint,
+                    &[],
+                    &format!("{error:?}"),
+                    "stop",
+                    "transmission failed; do not retry",
+                )
+                .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
+                return Err(transport_error("bulk-OUT", error));
+            }
         }
+        guard.check_recorded(rec)?;
         Ok(())
+    }
+
+    struct Guard {
+        values: BTreeMap<String, String>,
+        links: BTreeMap<String, String>,
+        inode: u64,
+        trace_instance: PathBuf,
+        usbmon_pid: i32,
+    }
+
+    impl Guard {
+        fn check_recorded(&self, rec: &mut Recorder) -> Result<(), (&'static str, String)> {
+            if let Err(error) = self.check() {
+                rec.event("GUARD", 0, &[], "CONTINUITY_LOST", "stop", &error)
+                    .map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
+                return Err(("IDENTITY_OR_CAPTURE_CONTINUITY_LOST", error));
+            }
+            Ok(())
+        }
+
+        fn load(out: &Path) -> Result<Self, String> {
+            let out = out.canonicalize().map_err(|e| e.to_string())?;
+            if out.parent() != Some(&Path::new(PROJECT).join("tmp"))
+                || !out.file_name().is_some_and(|s| {
+                    s.to_string_lossy()
+                        .starts_with("phase345-kdusb-protocol-discovery-")
+                })
+            {
+                return Err("output is not the admitted project evidence directory".into());
+            }
+            let sentinel =
+                fs::read_to_string(Path::new(PROJECT).join("tmp/phase345-live-consumed.txt"))
+                    .map_err(|e| format!("global sentinel absent: {e}"))?;
+            if !sentinel
+                .lines()
+                .any(|l| l == format!("EVIDENCE_DIRECTORY={}", out.display()))
+            {
+                return Err("global sentinel does not authorize this evidence directory".into());
+            }
+            let value: Value = serde_json::from_slice(
+                &fs::read(out.join("admission.json")).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let map = |key: &str| -> Result<BTreeMap<String, String>, String> {
+                value[key]
+                    .as_object()
+                    .ok_or_else(|| format!("missing {key}"))?
+                    .iter()
+                    .map(|(k, v)| {
+                        Ok((
+                            k.clone(),
+                            v.as_str()
+                                .ok_or_else(|| format!("{key} is not a string"))?
+                                .to_owned(),
+                        ))
+                    })
+                    .collect()
+            };
+            let guard = Self {
+                values: map("values")?,
+                links: map("links")?,
+                inode: value["device_inode"]
+                    .as_u64()
+                    .ok_or("missing device_inode")?,
+                trace_instance: PathBuf::from(
+                    value["trace_instance"]
+                        .as_str()
+                        .ok_or("missing trace_instance")?,
+                ),
+                usbmon_pid: value["usbmon_pid"].as_i64().ok_or("missing usbmon_pid")? as i32,
+            };
+            if guard.usbmon_pid <= 1
+                || !guard
+                    .trace_instance
+                    .starts_with("/sys/kernel/tracing/instances")
+            {
+                return Err("invalid capture admission".into());
+            }
+            for required in [
+                "/proc/sys/kernel/random/boot_id",
+                "/sys/bus/usb/devices/6-1/devnum",
+                "/sys/bus/usb/devices/6-1:1.0/ep_81/bEndpointAddress",
+                "/sys/bus/usb/devices/6-1:1.0/ep_01/bEndpointAddress",
+            ] {
+                if !guard.values.contains_key(required) {
+                    return Err(format!("missing required guard: {required}"));
+                }
+            }
+            Ok(guard)
+        }
+
+        fn check(&self) -> Result<(), String> {
+            for (path, expected) in &self.values {
+                let value =
+                    fs::read_to_string(path).map_err(|e| format!("identity file {path}: {e}"))?;
+                if value.trim() != expected {
+                    return Err(format!("identity changed: {path}"));
+                }
+            }
+            for (path, expected) in &self.links {
+                let actual =
+                    fs::canonicalize(path).map_err(|e| format!("identity link {path}: {e}"))?;
+                if actual.to_string_lossy() != expected.as_str() {
+                    return Err(format!("ownership/path changed: {path}"));
+                }
+            }
+            if fs::metadata("/sys/bus/usb/devices/6-1")
+                .map_err(|e| e.to_string())?
+                .ino()
+                != self.inode
+            {
+                return Err("USB device sysfs object replaced".into());
+            }
+            if Path::new("/sys/bus/usb/devices/6-1:1.0/driver").exists() {
+                return Err("interface driver attached".into());
+            }
+            let state = fs::read_to_string(self.trace_instance.join("tracing_on"))
+                .map_err(|e| e.to_string())?;
+            if state.trim() != "1" {
+                return Err("trace capture stopped".into());
+            }
+            for event in [
+                "xhci_urb_enqueue",
+                "xhci_handle_event",
+                "xhci_handle_transfer",
+            ] {
+                let enabled = fs::read_to_string(
+                    self.trace_instance
+                        .join(format!("events/xhci-hcd/{event}/enable")),
+                )
+                .map_err(|e| e.to_string())?;
+                if enabled.trim() != "1" {
+                    return Err(format!("tracepoint disabled: {event}"));
+                }
+            }
+            if unsafe { libc::kill(self.usbmon_pid, 0) } != 0 {
+                return Err("usbmon capture process disappeared".into());
+            }
+            Ok(())
+        }
     }
 
     fn transport_error(context: &str, error: rusb::Error) -> (&'static str, String) {
@@ -617,6 +739,7 @@ mod linux {
         let reader = BufReader::new(File::open(input).map_err(|e| e.to_string())?);
         let mut out = File::create(output).map_err(|e| e.to_string())?;
         let mut count = 0usize;
+        let mut conv = Conversation::default();
         for line in reader.lines() {
             let line = line.map_err(|e| e.to_string())?;
             if line.trim().is_empty() {
@@ -628,7 +751,21 @@ mod linux {
             };
             let bytes = hex::decode(encoded).map_err(|e| e.to_string())?;
             count += 1;
-            writeln!(out, "{}", json!({"event":count,"byte_length":bytes.len(),"hex":encoded,"classification":classification_json(&classify_usb_transfer(&bytes))})).map_err(|e| e.to_string())?;
+            let class = classify_usb_transfer(&bytes);
+            let direction = value
+                .get("direction")
+                .and_then(Value::as_str)
+                .unwrap_or("RX");
+            let action = if direction == "RX" {
+                if value.get("status").and_then(Value::as_str) == Some("TIMEOUT") {
+                    Some(conv.timeout())
+                } else {
+                    Some(conv.receive(&class, &bytes))
+                }
+            } else {
+                None
+            };
+            writeln!(out, "{}", json!({"event":count,"direction":direction,"reported_usb_length":value.get("reported_usb_length").or_else(||value.get("byte_length")),"prefix_only":value.get("prefix_only"),"byte_length":bytes.len(),"hex":encoded,"classification":classification_json(&class),"decision":action.map(|d|format!("{d:?}"))})).map_err(|e| e.to_string())?;
         }
         Ok(count)
     }
