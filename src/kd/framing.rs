@@ -682,6 +682,23 @@ mod tests {
     }
 
     #[test]
+    fn serial_missing_trailer_is_rejected_even_when_next_packet_is_available() {
+        let mut missing = data_packet(PACKET_TYPE_KD_STATE_CHANGE64, INITIAL_PACKET_ID, b"bad");
+        missing.pop();
+        missing.extend(data_packet(
+            PACKET_TYPE_KD_STATE_CHANGE64,
+            INITIAL_PACKET_ID,
+            b"next",
+        ));
+        let mut framing = KdFraming::new(Loopback::new(missing));
+        assert!(framing.recv_data().is_err());
+        assert_eq!(
+            framing.transport.outbound,
+            control_packet(PACKET_TYPE_KD_RESEND, 0)
+        );
+    }
+
+    #[test]
     fn send_data_writes_header_payload_trailer_and_consumes_ack() {
         let mut framing = KdFraming::new(Loopback::new(ack_for(
             (INITIAL_PACKET_ID | SYNC_PACKET_ID) & !SYNC_PACKET_ID,
