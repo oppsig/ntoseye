@@ -915,10 +915,7 @@ mod linux {
         fn r3_live_revision_is_open_before_exclusive_consumption() {
             assert!(live_campaign_enabled());
             assert_eq!(CAMPAIGN_CONSUMED_AT_UTC, "");
-            assert_eq!(
-                hex::encode(FIRST_ACK),
-                "69696969040000000008808000000000"
-            );
+            assert_eq!(hex::encode(FIRST_ACK), "69696969040000000008808000000000");
         }
 
         #[test]
