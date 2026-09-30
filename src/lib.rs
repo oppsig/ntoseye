@@ -171,6 +171,7 @@ pub mod guest;
 pub mod host;
 pub mod kd;
 pub mod kdusb_discovery;
+pub mod kdusb_discovery_r2;
 pub mod kdusb_endpoint_recreation;
 pub mod kdusb_probe;
 pub mod kdusb_same_configuration_live;
