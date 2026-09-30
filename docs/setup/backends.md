@@ -18,6 +18,16 @@
 | Bugcheck stops | Reported by the target | Reported by the target | Trapped at `nt!KeBugCheckEx` | No | Read from the dump |
 | [VTL1 inspection](../platforms/vbs.md) (AMD64) | Host memory source only | Host memory source only | Yes | Yes | No |
 
+The [classic KDUSB foundation](../kdusb.md) is Linux-only library work and is
+not selectable as a backend. Its present capability boundary is:
+
+| Classic KDUSB capability | Status |
+| --- | --- |
+| Complete inbound KD transfers / delayed NAME | Offline tested |
+| CONTROL serialization / USB3 chunk and ZLP planning | Offline tested |
+| Outbound DATA / break-in / GetVersion / debugger commands | Gated; unavailable |
+| Device discovery / ownership / reconnect | Deferred |
+
 ## Hypervisor setup
 
 The host configuration depends on the hypervisor:
