@@ -46,6 +46,9 @@ mod linux {
         0x00,
     ];
     const PROJECT: &str = "/home/kodi/engineering/CLSA0102-Reverse-Engineering-Project";
+    // This r1 authorization was consumed even though its first bulk transfer
+    // was never reached. Offline repairs must not reopen that authorization.
+    const CAMPAIGN_CONSUMED_AT_UTC: &str = "20260930T094552Z";
 
     #[derive(Clone)]
     struct Candidate {
@@ -175,6 +178,13 @@ mod linux {
             );
             return 2;
         }
+        if !live_campaign_enabled() {
+            println!("PHASE345_RESULT=CAMPAIGN_ALREADY_CONSUMED");
+            println!("CONSUMED_AT_UTC={CAMPAIGN_CONSUMED_AT_UTC}");
+            println!("LIVE_USB_ACTIVITY=false");
+            println!("PHASE340_CLEANUP_AUTHORIZED=false");
+            return 5;
+        }
         match campaign(Path::new(&args[3])) {
             Ok(result) => {
                 println!("PHASE345_RESULT={result}");
@@ -195,6 +205,7 @@ mod linux {
     fn dry_plan() {
         println!("NTOSEYE_KDUSB_PROTOCOL_DISCOVERY_R1=READY");
         println!("DEFAULT_MODE=DRY_PLAN");
+        println!("CAMPAIGN_LIVE_ENABLED={}", live_campaign_enabled());
         println!("FIRST_TX_HEX={}", hex::encode(FIRST_ACK));
         println!("MAX_ACKNOWLEDGED_KD_DATA={MAX_ACKED_DATA}");
         println!("MAX_BULK_IN_CALLS={MAX_READS}");
@@ -216,8 +227,12 @@ mod linux {
         println!("PHASE340_CLEANUP_AUTHORIZED=false");
     }
 
+    fn live_campaign_enabled() -> bool {
+        CAMPAIGN_CONSUMED_AT_UTC.is_empty()
+    }
+
     fn campaign(out: &Path) -> Result<String, (&'static str, String)> {
-        let guard = Guard::load(out).map_err(|e| ("PRELIVE_ADMISSION_INVALID", e))?;
+        let mut guard = Guard::load(out).map_err(|e| ("PRELIVE_ADMISSION_INVALID", e))?;
         guard.check().map_err(|e| ("IDENTITY_MISMATCH_ABORT", e))?;
         let mut found = candidates().map_err(|e| ("IDENTITY_MISMATCH_ABORT", e))?;
         if found.len() != 1 {
@@ -262,6 +277,9 @@ mod linux {
         handle
             .claim_interface(c.interface)
             .map_err(|e| ("OTHER_TRANSPORT_FAULT", format!("claim: {e}")))?;
+        // Linux binds the claimed interface to usbfs. This is ownership by
+        // this successful claim, not an independently attached kernel driver.
+        guard.claim_owned = true;
         let result = walk(&handle, &c, out, &guard);
         let release = handle.release_interface(c.interface);
         if let Err(e) = release {
@@ -277,7 +295,7 @@ mod linux {
         guard: &Guard,
     ) -> Result<String, (&'static str, String)> {
         let mut rec = Recorder::new(out).map_err(|e| ("EVIDENCE_IO_FAULT", e))?;
-        guard.check().map_err(|e| ("IDENTITY_MISMATCH_ABORT", e))?;
+        guard.check_recorded(&mut rec)?;
         // Binary-level global protection also prevents a direct second launch
         // with a different output directory after the shell was consumed.
         OpenOptions::new()
@@ -518,6 +536,7 @@ mod linux {
         inode: u64,
         trace_instance: PathBuf,
         usbmon_pid: i32,
+        claim_owned: bool,
     }
 
     impl Guard {
@@ -580,6 +599,7 @@ mod linux {
                         .ok_or("missing trace_instance")?,
                 ),
                 usbmon_pid: value["usbmon_pid"].as_i64().ok_or("missing usbmon_pid")? as i32,
+                claim_owned: false,
             };
             if guard.usbmon_pid <= 1
                 || !guard
@@ -623,9 +643,12 @@ mod linux {
             {
                 return Err("USB device sysfs object replaced".into());
             }
-            if Path::new("/sys/bus/usb/devices/6-1:1.0/driver").exists() {
-                return Err("interface driver attached".into());
-            }
+            let driver = match fs::canonicalize("/sys/bus/usb/devices/6-1:1.0/driver") {
+                Ok(path) => Some(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(format!("interface driver: {error}")),
+            };
+            validate_interface_driver(driver.as_deref(), self.claim_owned)?;
             let state = fs::read_to_string(self.trace_instance.join("tracing_on"))
                 .map_err(|e| e.to_string())?;
             if state.trim() != "1" {
@@ -649,6 +672,16 @@ mod linux {
                 return Err("usbmon capture process disappeared".into());
             }
             Ok(())
+        }
+    }
+
+    fn validate_interface_driver(driver: Option<&Path>, claim_owned: bool) -> Result<(), String> {
+        match (claim_owned, driver) {
+            (false, None) => Ok(()),
+            (true, Some(path)) if path == Path::new("/sys/bus/usb/drivers/usbfs") => Ok(()),
+            (false, Some(_)) => Err("interface driver attached before our claim".into()),
+            (true, None) => Err("our usbfs interface claim disappeared".into()),
+            (true, Some(_)) => Err("interface ownership changed away from our usbfs claim".into()),
         }
     }
 
@@ -792,6 +825,24 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn consumed_r1_cannot_be_reopened_by_offline_repairs() {
+            assert!(!live_campaign_enabled());
+            assert_eq!(CAMPAIGN_CONSUMED_AT_UTC, "20260930T094552Z");
+        }
+
+        #[test]
+        fn interface_guard_distinguishes_our_claim_from_external_drivers() {
+            let usbfs = Some(Path::new("/sys/bus/usb/drivers/usbfs"));
+            let other = Some(Path::new("/sys/bus/usb/drivers/usb-storage"));
+            assert!(validate_interface_driver(None, false).is_ok());
+            assert!(validate_interface_driver(usbfs, false).is_err());
+            assert!(validate_interface_driver(other, false).is_err());
+            assert!(validate_interface_driver(usbfs, true).is_ok());
+            assert!(validate_interface_driver(None, true).is_err());
+            assert!(validate_interface_driver(other, true).is_err());
+        }
 
         #[test]
         fn hard_budgets_and_first_action_are_fixed() {
