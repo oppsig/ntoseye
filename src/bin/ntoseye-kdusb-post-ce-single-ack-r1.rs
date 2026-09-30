@@ -100,9 +100,7 @@ mod linux {
             return 0;
         }
         if args != [LIVE_FLAG, REQUIRED_TARGET] {
-            eprintln!(
-                "usage: ntoseye-kdusb-post-ce-single-ack-r1 [{LIVE_FLAG} {REQUIRED_TARGET}]"
-            );
+            eprintln!("usage: ntoseye-kdusb-post-ce-single-ack-r1 [{LIVE_FLAG} {REQUIRED_TARGET}]");
             return 2;
         }
 
