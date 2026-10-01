@@ -2,11 +2,19 @@
 
 This Linux-only library foundation prepares classic USB2DBG transport for the
 existing KD engine. It is experimental and **not an attachable debugger backend**.
-There is no `--backend kdusb`, enumeration/open/claim helper, or `connect_usb`.
-Outbound DATA framing is now admitted at the transport adapter boundary, while
-break-in output remains gated. GetVersion is still not reachable through a real
-device because attach/discovery is not implemented. Modern KDNET-over-USB is a
-separate protocol.
+There is still no `--backend kdusb` and the stream is not added to
+`KdTransport` or `KdBackend`.
+
+The library now contains an evidence-bounded Linux opener,
+`kd::kdusb::connect_named`, for the exact admitted USB2DBG topology. It
+enumerates only VID:PID `3495:00e0`, accepts interface `dc/02/ff` at alternate
+setting zero, requires bulk endpoints `81/01` with max-packet 1024, refuses to
+detach a kernel driver, claims the interface, and verifies target identity with
+`NAME?`. It does **not** change configuration, select an alternate setting,
+reset the device, emit KD break-in, or expose normal debugger attach.
+
+Outbound DATA framing is admitted at the transport adapter boundary while
+break-in remains gated. Modern KDNET-over-USB is a separate protocol.
 
 ## Boundary adaptation
 
@@ -70,20 +78,24 @@ These decisions are tested without a device. The small synchronous FFI call
 borrows a live handle and slice; it does not retain pointers or manipulate
 interface state. See [rusb 0.9.4's bulk methods](https://docs.rs/rusb/0.9.4/src/rusb/device_handle.rs.html).
 
-A blanket `BulkIo` implementation for `rusb::DeviceHandle` accepts a handle whose
-ownership and endpoints a future admission layer establishes. No code here
-obtains a real handle. The generic stream is suitable for testing existing
-`KdFraming::new(stream)` receive behavior; it is not added to `KdTransport` or
-`KdBackend`. `KdFraming` currently masks SYNC in classic ACKs. The exact-ID ACK
-required by the retained control experiment is tested through the stream
-serializer, **not claimed as the existing framing engine's ACK policy**.
+A blanket `BulkIo` implementation for `rusb::DeviceHandle` preserves libusb
+completion status. The Linux opener establishes ownership and exact endpoints
+without changing device configuration. It accepts only alternate setting zero
+and never calls an alternate-setting selector. If a kernel driver owns the
+interface it fails closed instead of detaching it.
 
-Future discovery should use the admitted active interface and bulk endpoint
-descriptors, followed by target NAME matching. Descriptor enumeration lists
-possible alternate settings; it does not show which is active. There is no
-source-backed need to select a nonzero alternate setting for the retained model.
-Do not detach drivers or change configuration/alternate state automatically.
-Opening devices, reconnect/re-enumeration and identity policy remain deferred.
+NAME discovery is performed through the same `KdUsbStream` receive state used
+by KD framing. KD completions that arrive before the NAME reply are normalized
+and queued rather than consumed by discovery; split NAME remains supported across
+transfer boundaries and ZLPs. A target-name mismatch closes that candidate when
+the handle is dropped.
+
+The generic stream remains absent from `KdTransport` and `KdBackend`.
+`KdFraming` currently masks SYNC in classic ACKs. The exact-ID ACK required by
+the retained control experiment is tested through the stream serializer,
+**not claimed as the existing framing engine's ACK policy**. Reconnect/
+re-enumeration, normal attach, break-in output, and ACK/packet-ID live
+equivalence remain deferred.
 
 ## Evidence and provenance
 
