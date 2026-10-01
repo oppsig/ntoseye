@@ -3,8 +3,10 @@
 This Linux-only library foundation prepares classic USB2DBG transport for the
 existing KD engine. It is experimental and **not an attachable debugger backend**.
 There is no `--backend kdusb`, enumeration/open/claim helper, or `connect_usb`.
-Outbound DATA and break-in output are rejected before any bulk write. GetVersion
-cannot run through this adapter. Modern KDNET-over-USB is a separate protocol.
+Outbound DATA framing is now admitted at the transport adapter boundary, while
+break-in output remains gated. GetVersion is still not reachable through a real
+device because attach/discovery is not implemented. Modern KDNET-over-USB is a
+separate protocol.
 
 ## Boundary adaptation
 
@@ -42,12 +44,20 @@ so cloning neither duplicates nor drops prefetched data. Empty caller buffers
 return zero without I/O. Nonempty reads use a finite deadline, including ZLP and
 NAME traffic; a split NAME survives an idle timeout.
 
-Writes stage one CONTROL packet until `flush`. Clones have separate staging and
-share a lock across the entire logical write, including ZLP. USB3 logical writes
-are chunked at 4096 bytes with a final ZLP for a nonempty exact multiple of the
-OUT endpoint maximum packet size. This rule is independent of KD DATA framing.
-A partial/error write disables output on all clones until a new stream is
-created; it is not automatically replayed. Tests use only `FakeBulk`.
+Writes stage one complete logical KD packet until `flush`. CONTROL is emitted
+unchanged. Existing generic `KdFraming` still produces serial-compatible DATA as
+`header + payload + 0xaa`; for KDUSB, the adapter requires that internal trailer,
+strips exactly that byte, re-validates `header + payload`, and only then begins
+bulk OUT. This keeps KDCOM behavior unchanged while matching the recovered
+WinDbg/USB2DBG contract.
+
+Clones have separate staging and share a lock across the entire logical write,
+including ZLP. USB3 logical writes are chunked at 4096 bytes with a final ZLP for
+a nonempty exact multiple of the OUT endpoint maximum packet size. The ZLP rule
+is applied after the DATA trailer has been stripped, because it depends on the
+actual USB logical write length. A partial/error write disables output on all
+clones until a new stream is created; it is not automatically replayed. Tests use
+only `FakeBulk`.
 
 ## Integration boundary
 
@@ -101,7 +111,20 @@ distinguishes packet and byte transports; it does not settle legacy USB2DBG DATA
 framing. [KDNET's public dissector](https://github.com/Lekensteyn/kdnet/blob/2ff242f828ca2a5dd29359c7e5201079f20e4792/kdnet.lua)
 concerns another transport. No code from those implementations was copied.
 
-Outbound DATA trailer behavior remains unresolved. A successful 16-byte ACK
-only demonstrates CONTROL handling. Before normal attach, obtain independent
-source evidence or an authorized host-to-target DATA capture, establish USB ACK
-and packet-ID semantics, and validate timeout/discovery/reconnect lifecycle.
+Outbound DATA trailer behavior is resolved by the exact Phase 3.49B/3.49C
+host-binary proof. The concrete USB2DBG transport builds DATA as a 16-byte header
+plus the declared payload, computes the exact logical length as
+`16 + payload lengths`, and preserves that pointer/length through the USB helper
+into `WriteFile`. The matching USB2DBG.SYS static recovery maps those logical
+bytes onto bulk OUT with no KD envelope insertion. Therefore KDUSB DATA does not
+carry a terminal `0xaa`; the trailer remains only an internal compatibility byte
+for the existing generic framing engine.
+
+The adjudication is recorded in the CLSA0102 project Phase 3.49C branch and is
+pinned to dbgeng.dll
+`cbe746c86e00a736091710f97b8791f24dfe155aef325ba25e572f2d3fa9179f`
+and USB2DBG.SYS
+`3074ae7f9375ed50149fc3ba8b913f54ae85532177acfab12982ba83c135ec0c`.
+Break-in output, active USB discovery/claim, ACK/packet-ID live equivalence,
+timeouts and reconnect lifecycle still require separate admission/validation
+before normal attach.
