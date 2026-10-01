@@ -29,7 +29,11 @@ const NAME_MAX: usize = NAME_PREFIX.len() + TARGET_NAME_MAX + 2;
 pub const RECEIVE_CAPACITY: usize = RECEIVE_QUANTUM + 1;
 
 mod discovery;
-pub use discovery::{LinuxKdUsbStream, connect_named};
+pub use discovery::{
+    KDUSB_BULK_IN, KDUSB_BULK_OUT, KDUSB_INTERFACE_ALT_SETTING, KDUSB_INTERFACE_CLASS,
+    KDUSB_INTERFACE_PROTOCOL, KDUSB_INTERFACE_SUBCLASS, KDUSB_MAX_PACKET, KDUSB_PRODUCT_ID,
+    KDUSB_VENDOR_ID, LinuxKdUsbStream, connect_named,
+};
 
 /// A whole completion's shape. Checksums and packet IDs remain `KdFraming`'s job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
