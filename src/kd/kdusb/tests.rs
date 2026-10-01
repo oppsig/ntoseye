@@ -152,6 +152,44 @@ fn control_is_exactly_sixteen_bytes_and_ack_bytes_are_preserved() {
 }
 
 #[test]
+fn name_probe_preserves_prefetched_kd_before_matching_identity() {
+    let payload = b"prefetched-before-name";
+    let mut s = stream(vec![
+        data(INITIAL_PACKET_ID, payload, false),
+        b"NAME=CLSA0102_USB\0\0".to_vec(),
+    ]);
+
+    s.probe_name(b"CLSA0102_USB").unwrap();
+
+    {
+        let writes = s.io.writes.lock().unwrap();
+        assert_eq!(writes.as_slice(), [NAME_PROBE.to_vec()]);
+    }
+
+    let mut kd = KdFraming::new(s);
+    assert_eq!(kd.recv_data().unwrap().payload, payload);
+    let writes = kd.transport_ref().io.writes.lock().unwrap();
+    assert_eq!(writes[0], NAME_PROBE);
+    assert_eq!(
+        Header::peek(&writes[1]).unwrap().packet_type,
+        PACKET_TYPE_KD_ACKNOWLEDGE
+    );
+}
+
+#[test]
+fn name_probe_accepts_split_identity_with_zlp_without_losing_deadline() {
+    let mut s = stream(vec![
+        b"NAME=CLSA".to_vec(),
+        vec![],
+        b"0102_USB\0\0".to_vec(),
+    ]);
+
+    s.probe_name(b"CLSA0102_USB").unwrap();
+    assert_eq!(*s.io.writes.lock().unwrap(), vec![NAME_PROBE.to_vec()]);
+    assert!(s.take_name().unwrap().is_none());
+}
+
+#[test]
 fn delayed_name_preserves_entire_pre_name_data_packet() {
     let payload = vec![0x72; 330];
     let mut kd = KdFraming::new(stream(vec![
