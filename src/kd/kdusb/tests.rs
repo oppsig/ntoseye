@@ -332,20 +332,59 @@ fn concurrent_clones_do_not_interleave_control_and_zlp() {
 }
 
 #[test]
-fn outbound_data_cannot_reach_usb_even_through_kd_framing() {
-    let mut kd = KdFraming::new(stream(vec![]));
-    assert!(
-        kd.send_data(PACKET_TYPE_KD_STATE_MANIPULATE, &[0; 56])
-            .is_err()
-    );
-    assert!(kd.transport_ref().io.writes.lock().unwrap().is_empty());
-    let mut s = stream(vec![]);
-    s.write_all(&Header::data(PACKET_TYPE_KD_STATE_MANIPULATE, INITIAL_PACKET_ID, &[]).encode())
+fn outbound_data_strips_internal_trailer_before_usb() {
+    let payload = [0x35; 56];
+    let ack = Header::control(PACKET_TYPE_KD_ACKNOWLEDGE, INITIAL_PACKET_ID)
+        .encode()
+        .to_vec();
+    let mut kd = KdFraming::new(stream(vec![ack]));
+
+    kd.send_data(PACKET_TYPE_KD_STATE_MANIPULATE, &payload)
         .unwrap();
-    assert_eq!(s.flush().unwrap_err().kind(), io::ErrorKind::Unsupported);
+
+    let mut expected =
+        Header::data(PACKET_TYPE_KD_STATE_MANIPULATE, INITIAL_PACKET_ID, &payload)
+            .encode()
+            .to_vec();
+    expected.extend_from_slice(&payload);
+    assert_eq!(expected.len(), 72);
+
+    let writes = kd.transport_ref().io.writes.lock().unwrap();
+    assert_eq!(*writes, vec![expected]);
+    assert_ne!(writes[0].last(), Some(&PACKET_TRAILING_BYTE));
+}
+
+#[test]
+fn usb_data_uses_wire_length_for_zlp_after_trailer_strip() {
+    // 16-byte header + 1008-byte payload = one exact 1024-byte USB transfer.
+    // Generic KdFraming stages 1025 bytes including its internal 0xaa; the USB
+    // adapter strips it first, so the recovered USB2DBG ZLP rule applies to 1024.
+    let payload = vec![0x41; 1008];
+    let ack = Header::control(PACKET_TYPE_KD_ACKNOWLEDGE, INITIAL_PACKET_ID)
+        .encode()
+        .to_vec();
+    let mut kd = KdFraming::new(stream(vec![ack]));
+
+    kd.send_data(PACKET_TYPE_KD_STATE_MANIPULATE, &payload)
+        .unwrap();
+
+    let writes = kd.transport_ref().io.writes.lock().unwrap();
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].len(), 1024);
+    assert!(writes[1].is_empty());
+    assert_ne!(writes[0].last(), Some(&PACKET_TRAILING_BYTE));
+}
+
+#[test]
+fn direct_trailerless_data_and_breakin_remain_rejected_at_internal_boundary() {
+    let mut s = stream(vec![]);
+    let bare = data(INITIAL_PACKET_ID, b"payload", false);
+    s.write_all(&bare).unwrap();
+    assert_eq!(s.flush().unwrap_err().kind(), io::ErrorKind::InvalidData);
     assert!(s.io.writes.lock().unwrap().is_empty());
-    s.write_all(&[0x62]).unwrap();
-    assert!(s.flush().is_err());
+
+    s.write_all(&[BREAKIN_BYTE]).unwrap();
+    assert_eq!(s.flush().unwrap_err().kind(), io::ErrorKind::Unsupported);
     assert!(s.io.writes.lock().unwrap().is_empty());
 }
 
