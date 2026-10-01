@@ -6,7 +6,6 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn main() {
-    use std::process::ExitCode;
     match linux::run() {
         Ok(()) => {}
         Err((code, error)) => {
