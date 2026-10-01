@@ -2,8 +2,9 @@
 //!
 //! Complete USB transfers are classified before adapting them to `KdFraming`.
 //! No discovery/open/claim API or debugger backend activation is provided.
-//! Outbound DATA is deliberately unsupported until its wire contract is known.
-//! See `docs/kdusb.md` for evidence, provenance and limits.
+//! Outbound DATA is adapted at this USB boundary: generic `KdFraming` keeps
+//! its serial-compatible trailing 0xaa internally, while KDUSB strips exactly
+//! that byte before bulk OUT. See `docs/kdusb.md` for evidence and limits.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -11,8 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::framing::{
-    CONTROL_PACKET_LEADER, HEADER_SIZE, Header, PACKET_MAX_SIZE, PACKET_TRAILING_BYTE,
-    PACKET_TYPE_KD_ACKNOWLEDGE, PACKET_TYPE_KD_RESEND, PACKET_TYPE_KD_RESET,
+    BREAKIN_BYTE, CONTROL_PACKET_LEADER, HEADER_SIZE, Header, PACKET_MAX_SIZE,
+    PACKET_TRAILING_BYTE, PACKET_TYPE_KD_ACKNOWLEDGE, PACKET_TYPE_KD_RESEND,
+    PACKET_TYPE_KD_RESET,
 };
 
 // Independently recovered USB2DBG/target wire constants, not copied driver code.
@@ -250,7 +252,10 @@ impl ReceiveState {
     }
 }
 
-/// Boundary-aware inbound adapter for existing KD framing, with CONTROL-only output.
+/// Boundary-aware adapter for existing KD framing.
+/// Inbound trailer-less USB DATA gets one synthetic 0xaa for `KdFraming`.
+/// Outbound DATA must contain that internal trailer and loses it before bulk OUT.
+/// CONTROL is unchanged; break-in remains gated.
 /// Clones share unread bytes and a logical-write lock; write staging is per clone.
 pub struct KdUsbStream<I: BulkIo> {
     io: Arc<I>,
@@ -355,12 +360,15 @@ impl<I: BulkIo> Read for KdUsbStream<I> {
 
 impl<I: BulkIo> Write for KdUsbStream<I> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-        // This foundation accepts only one 16-byte CONTROL logical write.
-        if self.transmit.len() + input.len() > HEADER_SIZE {
+        // Generic KdFraming emits DATA as header + payload + 0xaa. Stage one
+        // complete logical packet so this adapter can strip that internal-only
+        // trailer atomically before the first bulk OUT.
+        let max_staged = HEADER_SIZE + PACKET_MAX_SIZE + 1;
+        if self.transmit.len() + input.len() > max_staged {
             self.transmit.clear();
             return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "KDUSB DATA/break-in output is gated",
+                io::ErrorKind::InvalidInput,
+                "KDUSB logical write exceeds maximum KD DATA packet",
             ));
         }
         self.transmit.extend_from_slice(input);
@@ -371,13 +379,34 @@ impl<I: BulkIo> Write for KdUsbStream<I> {
         if self.transmit.is_empty() {
             return Ok(());
         }
-        let logical = std::mem::take(&mut self.transmit);
-        if classify_transfer(&logical)? != PacketShape::Control {
+
+        let mut wire = std::mem::take(&mut self.transmit);
+        if wire.as_slice() == [BREAKIN_BYTE] {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "KDUSB DATA output is gated",
+                "KDUSB break-in output is not yet admitted",
             ));
         }
+
+        match classify_transfer(&wire)? {
+            PacketShape::Control => {}
+            PacketShape::Data { trailer: true, .. } => {
+                let trailer = wire.pop();
+                debug_assert_eq!(trailer, Some(PACKET_TRAILING_BYTE));
+                if !matches!(
+                    classify_transfer(&wire)?,
+                    PacketShape::Data { trailer: false, .. }
+                ) {
+                    return Err(invalid("KDUSB DATA trailer normalization failed"));
+                }
+            }
+            PacketShape::Data { trailer: false, .. } => {
+                return Err(invalid(
+                    "KDUSB internal DATA write is missing KdFraming trailer",
+                ));
+            }
+        }
+
         let _lock = self
             .write_lock
             .lock()
@@ -390,10 +419,10 @@ impl<I: BulkIo> Write for KdUsbStream<I> {
             return Err(io::Error::other("KDUSB output failed; reopen required"));
         }
         let mut offset = 0;
-        for len in usb3_write_plan(logical.len(), self.endpoints.max_packet)? {
+        for len in usb3_write_plan(wire.len(), self.endpoints.max_packet)? {
             match self.io.write_bulk(
                 self.endpoints.output,
-                &logical[offset..offset + len],
+                &wire[offset..offset + len],
                 self.timeout,
             ) {
                 Ok(written) if written == len => offset += len,
