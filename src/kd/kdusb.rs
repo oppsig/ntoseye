@@ -340,7 +340,16 @@ impl<I: BulkIo> KdUsbStream<I> {
 
         let written = self
             .io
-            .write_bulk(self.endpoints.output, NAME_PROBE, self.timeout)?;
+            .write_bulk(self.endpoints.output, NAME_PROBE, self.timeout)
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "KDUSB NAME? bulk OUT endpoint {:#04x} failed: {err}",
+                        self.endpoints.output
+                    ),
+                )
+            })?;
         if written != NAME_PROBE.len() {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -383,7 +392,16 @@ impl<I: BulkIo> KdUsbStream<I> {
             let mut transfer = [0u8; RECEIVE_CAPACITY];
             let len = self
                 .io
-                .read_bulk(self.endpoints.input, &mut transfer, remaining)?;
+                .read_bulk(self.endpoints.input, &mut transfer, remaining)
+                .map_err(|err| {
+                    io::Error::new(
+                        err.kind(),
+                        format!(
+                            "KDUSB NAME reply bulk IN endpoint {:#04x} failed: {err}",
+                            self.endpoints.input
+                        ),
+                    )
+                })?;
             let bytes = transfer
                 .get(..len)
                 .ok_or_else(|| invalid("bulk read overflow"))?;
