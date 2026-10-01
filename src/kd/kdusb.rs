@@ -28,6 +28,9 @@ const NAME_MAX: usize = NAME_PREFIX.len() + TARGET_NAME_MAX + 2;
 // One extra byte accommodates a maximum-size packet with a tolerated trailer.
 pub const RECEIVE_CAPACITY: usize = RECEIVE_QUANTUM + 1;
 
+mod discovery;
+pub use discovery::{LinuxKdUsbStream, connect_named};
+
 /// A whole completion's shape. Checksums and packet IDs remain `KdFraming`'s job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketShape {
@@ -319,6 +322,76 @@ impl<I: BulkIo> KdUsbStream<I> {
             .map_err(|_| io::Error::other("receive lock poisoned"))?
             .names
             .pop_front())
+    }
+
+    /// Send NAME? and wait for the matching target identity without discarding
+    /// KD completions that arrive before the NAME reply.
+    pub(crate) fn probe_name(&mut self, expected: &[u8]) -> io::Result<()> {
+        if expected.is_empty()
+            || expected.len() > TARGET_NAME_MAX
+            || !expected.is_ascii()
+            || expected.contains(&0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "KDUSB target name must be 1..=24 non-NUL ASCII bytes",
+            ));
+        }
+
+        let written = self
+            .io
+            .write_bulk(self.endpoints.output, NAME_PROBE, self.timeout)?;
+        if written != NAME_PROBE.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!(
+                    "short KDUSB NAME? probe: wrote {written} of {} bytes",
+                    NAME_PROBE.len()
+                ),
+            ));
+        }
+
+        let start = Instant::now();
+        loop {
+            {
+                let mut receive = self
+                    .receive
+                    .lock()
+                    .map_err(|_| io::Error::other("receive lock poisoned"))?;
+                if let Some(name) = receive.names.pop_front() {
+                    if name == expected {
+                        return Ok(());
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "KDUSB NAME mismatch: expected {:?}, got {:?}",
+                            String::from_utf8_lossy(expected),
+                            String::from_utf8_lossy(&name)
+                        ),
+                    ));
+                }
+            }
+
+            let remaining = self
+                .timeout
+                .checked_sub(start.elapsed())
+                .filter(|t| !t.is_zero())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "KDUSB NAME discovery deadline")
+                })?;
+            let mut transfer = [0u8; RECEIVE_CAPACITY];
+            let len = self
+                .io
+                .read_bulk(self.endpoints.input, &mut transfer, remaining)?;
+            let bytes = transfer
+                .get(..len)
+                .ok_or_else(|| invalid("bulk read overflow"))?;
+            self.receive
+                .lock()
+                .map_err(|_| io::Error::other("receive lock poisoned"))?
+                .ingest(bytes)?;
+        }
     }
 }
 
