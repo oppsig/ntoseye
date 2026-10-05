@@ -682,7 +682,7 @@ mod linux {
                     fs::write(p.join(k), v).unwrap();
                 }
             }
-            assert_eq!(admission(&root).unwrap(), 10);
+            assert_eq!(admission(&root).unwrap(), 2);
             fs::write(d.join("devnum"), "3").unwrap();
             assert!(admission(&root).is_err());
             fs::write(d.join("devnum"), "2").unwrap();
