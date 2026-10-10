@@ -138,6 +138,13 @@ fn is_temporary_read_error(kind: ErrorKind) -> bool {
     matches!(kind, ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
+fn is_terminal_transport_error(error: &std::io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    { super::kdusb::is_terminal_error(error) }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = error; false }
+}
+
 #[derive(Debug, Clone)]
 pub struct DataPacket {
     pub packet_type: u16,
@@ -334,7 +341,8 @@ impl<T: Read + Write> KdFraming<T> {
             // inner loop triggers a resend via the outer loop
             loop {
                 match self.recv_any() {
-                    Err(Error::Io(e)) if is_temporary_read_error(e.kind()) => {
+                    Err(Error::Io(e)) if is_temporary_read_error(e.kind())
+                        && !is_terminal_transport_error(&e) => {
                         kd_trace!("kd: send_data: no ACK before read timeout, retransmitting");
                         break;
                     }
