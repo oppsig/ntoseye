@@ -63,6 +63,8 @@ mod handles;
 mod hw_breakpoints;
 pub mod hwbp;
 mod kdnet;
+#[cfg(target_os = "linux")]
+pub mod kdusb;
 mod memory;
 mod pump;
 mod registers;
