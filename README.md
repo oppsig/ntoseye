@@ -9,6 +9,10 @@
 
 A WinDbg-like Windows debugger for Linux and macOS, with support for kernel-mode and user-mode debugging of virtual and physical machines, and offline crash-dump analysis.
 
+## Experimental classic KDUSB work in this fork
+
+The fork contains **separate unmerged research branches** for classic Windows USB2DBG/KDUSB. The [KDUSB transport foundation](docs/kdusb.md) and [cross-project handoff plan](docs/kdusb-research-handoff.md) explain the support limits, engineering responsibilities and upstreamization gates. The evidence-generating THOR/ZEUS research belongs to [CLSA0102-Reverse-Engineering-Project](https://github.com/oppsig/CLSA0102-Reverse-Engineering-Project). **There is no supported `--backend kdusb` on this branch or a verified live attach.** This is distinct from the supported KDNET transport.
+
 ## Showcase
 
 | Debugging via REPL | Debugging via VSCode + DAP |
