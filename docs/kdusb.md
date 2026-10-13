@@ -1,5 +1,7 @@
 # Classic KDUSB transport foundation
 
+> **Research and product split (October 2026):** This page describes an experimental ntoseye transport *foundation*, not a shipping KDUSB debugger. The raw reverse-engineering evidence and THOR/ZEUS hardware experiments live in [CLSA0102](https://github.com/oppsig/CLSA0102-Reverse-Engineering-Project). The [cross-project migration and acceptance plan](kdusb-research-handoff.md) defines what ntoseye may incorporate, the distinct feature branches, and why USB enumeration, offline tests and a controller power wake do not grant live `NAME?` authorization. The fork's `master` and the upstream debugger are **not** claimed to support classic KDUSB.
+
 This Linux-only library foundation prepares classic USB2DBG transport for the
 existing KD engine. It is experimental and **not an attachable debugger backend**.
 There is no `--backend kdusb`, enumeration/open/claim helper, or `connect_usb`.
